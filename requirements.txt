@@ -1,2 +1,4 @@
 odrive
 ipython
+PyQt5
+pyqtgraph
