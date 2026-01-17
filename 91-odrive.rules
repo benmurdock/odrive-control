@@ -1,0 +1,8 @@
+# ODrive USB rules
+# This allows non-root users to access ODrive devices
+
+# ODrive v3.x
+SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="0d32", MODE="0666"
+
+# ODrive (alternative product ID)
+SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="0d31", MODE="0666"
