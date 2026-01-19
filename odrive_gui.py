@@ -18,14 +18,17 @@ from collections import deque
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QSlider, QPushButton,
                              QGraphicsProxyWidget, QSpinBox, QStyle,
-                             QStyleOptionSlider, QCheckBox)
+                             QStyleOptionSlider, QCheckBox, QRadioButton,
+                             QButtonGroup, QFrame)
 from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QColor, QPainter, QBrush, QPen, QLinearGradient
 import pyqtgraph as pg
 
 import odrive
 from odrive.enums import (AXIS_STATE_IDLE, AXIS_STATE_CLOSED_LOOP_CONTROL,
-                          AXIS_STATE_FULL_CALIBRATION_SEQUENCE, CONTROL_MODE_VELOCITY_CONTROL)
+                          AXIS_STATE_FULL_CALIBRATION_SEQUENCE,
+                          CONTROL_MODE_VELOCITY_CONTROL, CONTROL_MODE_TORQUE_CONTROL,
+                          CONTROL_MODE_POSITION_CONTROL)
 
 # ODrive error code descriptions (for firmware 0.5.x)
 AXIS_ERRORS = {
@@ -165,7 +168,16 @@ class ODriveReader(QThread):
         self.odrv = odrv
         self.axis = axis
         self.running = True
+
+        # Control commands (only one active at a time based on mode)
         self.target_velocity = 0.0  # turns/sec
+        self.target_torque = 0.0    # Amps (Iq)
+        self.target_position = 0.0  # turns
+
+        # Control mode (torque mode default for exercise machine use case)
+        self.control_mode = CONTROL_MODE_TORQUE_CONTROL
+        self.requested_mode_change = None  # Pending mode change request
+
         self.requested_state = None  # Pending state change request
         self.enabled = False  # Track if motor should be in closed loop
         self.clear_errors_requested = False  # Flag to clear errors
@@ -173,6 +185,19 @@ class ODriveReader(QThread):
     def set_velocity(self, velocity):
         """Thread-safe way to update velocity command"""
         self.target_velocity = velocity
+
+    def set_torque(self, torque):
+        """Thread-safe way to update torque command (Iq in Amps)"""
+        self.target_torque = torque
+
+    def set_position(self, position):
+        """Thread-safe way to update position command (turns)"""
+        self.target_position = position
+
+    def request_mode_change(self, mode):
+        """Thread-safe way to request a control mode change"""
+        print(f"[DEBUG] Requesting mode change: {mode}")
+        self.requested_mode_change = mode
 
     def request_state(self, state):
         """Thread-safe way to request a state change"""
@@ -221,6 +246,27 @@ class ODriveReader(QThread):
                     self.clear_errors_requested = False
                     print("[DEBUG] Errors cleared")
 
+                # Handle pending mode change request
+                if self.requested_mode_change is not None:
+                    print(f"[DEBUG] Applying mode change: {self.requested_mode_change}")
+                    self.axis.controller.config.control_mode = self.requested_mode_change
+                    self.control_mode = self.requested_mode_change
+
+                    # For position control, also set input_mode to passthrough (1)
+                    # This ensures input_pos is used directly without trajectory planning
+                    if self.control_mode == CONTROL_MODE_POSITION_CONTROL:
+                        self.axis.controller.config.input_mode = 1  # INPUT_MODE_PASSTHROUGH
+                        print("[DEBUG] Set input_mode to PASSTHROUGH for position control")
+                    elif self.control_mode == CONTROL_MODE_VELOCITY_CONTROL:
+                        self.axis.controller.config.input_mode = 1  # INPUT_MODE_PASSTHROUGH
+                    elif self.control_mode == CONTROL_MODE_TORQUE_CONTROL:
+                        self.axis.controller.config.input_mode = 1  # INPUT_MODE_PASSTHROUGH
+
+                    # Note: Initial values are set by the GUI via set_position/set_torque/set_velocity
+                    # immediately after requesting the mode change
+                    self.requested_mode_change = None
+                    print("[DEBUG] Mode change applied")
+
                 # Read current state
                 position = self.axis.encoder.pos_estimate  # turns
                 velocity = self.axis.encoder.vel_estimate  # turns/sec
@@ -228,9 +274,20 @@ class ODriveReader(QThread):
                 voltage = self.odrv.vbus_voltage  # volts
                 current_state = self.axis.current_state
 
-                # Write velocity command (only if in closed loop control)
+                # Write command based on current control mode (only if in closed loop)
                 if current_state == AXIS_STATE_CLOSED_LOOP_CONTROL:
-                    self.axis.controller.input_vel = self.target_velocity
+                    # Debug: print mode and command every ~1 second (every 1000 loops)
+                    if gui_update_counter == 0:
+                        actual_mode = self.axis.controller.config.control_mode
+                        actual_input_mode = self.axis.controller.config.input_mode
+                        print(f"[THREAD] Mode={self.control_mode}, ODrive_mode={actual_mode}, input_mode={actual_input_mode}, pos={self.target_position:.2f}, encoder_pos={position:.2f}")
+
+                    if self.control_mode == CONTROL_MODE_VELOCITY_CONTROL:
+                        self.axis.controller.input_vel = self.target_velocity
+                    elif self.control_mode == CONTROL_MODE_TORQUE_CONTROL:
+                        self.axis.controller.input_torque = self.target_torque
+                    elif self.control_mode == CONTROL_MODE_POSITION_CONTROL:
+                        self.axis.controller.input_pos = self.target_position
 
                 # Throttle GUI updates to ~50Hz (every 20 loops at 1ms = 20ms)
                 gui_update_counter += 1
@@ -297,9 +354,18 @@ class ODriveGUI(QMainWindow):
         self.voltage = 0.0
         self.loop_time_ms = 0.0
 
-        # Control
+        # Control mode (torque default for exercise machine use case)
+        self.current_control_mode = CONTROL_MODE_TORQUE_CONTROL
+
+        # Control commands
         self.commanded_velocity = 0.0
-        self.max_velocity_limit = 10.0  # turns/sec - conservative default
+        self.commanded_torque = 0.0
+        self.commanded_position = 0.0
+
+        # Limits
+        self.max_velocity_limit = 10.0  # turns/sec
+        self.max_torque_limit = 5.0     # Amps
+        self.max_position_limit = 10.0  # turns
 
         # Error tracking
         self.has_errors = False
@@ -464,7 +530,7 @@ class ODriveGUI(QMainWindow):
         # Header with enable checkbox and stop button
         control_header = QHBoxLayout()
 
-        header_label = QLabel("Velocity Control")
+        header_label = QLabel("Motor Control")
         header_label.setObjectName("sectionHeader")
         control_header.addWidget(header_label)
 
@@ -493,14 +559,115 @@ class ODriveGUI(QMainWindow):
 
         control_layout.addLayout(control_header)
 
-        # Velocity slider
-        velocity_layout = QHBoxLayout()
+        # Create mode button group for radio buttons
+        self.mode_button_group = QButtonGroup(self)
+
+        # === Torque Control Row (default) ===
+        self.torque_row = QWidget()
+        torque_layout = QHBoxLayout(self.torque_row)
+        torque_layout.setContentsMargins(5, 5, 5, 5)
+
+        self.torque_radio = QRadioButton()
+        self.torque_radio.setChecked(True)  # Torque is default mode
+        self.mode_button_group.addButton(self.torque_radio, CONTROL_MODE_TORQUE_CONTROL)
+        torque_layout.addWidget(self.torque_radio)
+
+        torque_label = QLabel("Torque")
+        torque_label.setFixedWidth(80)
+        torque_layout.addWidget(torque_label)
+
+        self.torque_slider = CenterZeroSlider(Qt.Horizontal)
+        self.torque_slider.setMinimum(-500)  # -5.0 A (scaled by 100 for 0.01A resolution)
+        self.torque_slider.setMaximum(500)   # +5.0 A
+        self.torque_slider.setValue(0)
+        self.torque_slider.valueChanged.connect(self.on_torque_changed)
+        torque_layout.addWidget(self.torque_slider)
+
+        self.torque_value_label = QLabel("0.00")
+        self.torque_value_label.setObjectName("valueDisplay")
+        self.torque_value_label.setFixedWidth(80)
+        self.torque_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        torque_layout.addWidget(self.torque_value_label)
+
+        torque_unit = QLabel("A")
+        torque_unit.setStyleSheet("color: #a0a0a0;")
+        torque_unit.setFixedWidth(50)
+        torque_layout.addWidget(torque_unit)
+
+        torque_limit_label = QLabel("Max:")
+        torque_limit_label.setStyleSheet("color: #a0a0a0;")
+        torque_layout.addWidget(torque_limit_label)
+
+        self.max_torque_spinbox = QSpinBox()
+        self.max_torque_spinbox.setMinimum(1)
+        self.max_torque_spinbox.setMaximum(20)
+        self.max_torque_spinbox.setValue(5)
+        self.max_torque_spinbox.setSuffix(" A")
+        self.max_torque_spinbox.setFixedWidth(70)
+        self.max_torque_spinbox.valueChanged.connect(self.on_max_torque_changed)
+        torque_layout.addWidget(self.max_torque_spinbox)
+
+        control_layout.addWidget(self.torque_row)
+
+        # === Position Control Row ===
+        self.position_row = QWidget()
+        position_layout = QHBoxLayout(self.position_row)
+        position_layout.setContentsMargins(5, 5, 5, 5)
+
+        self.position_radio = QRadioButton()
+        self.mode_button_group.addButton(self.position_radio, CONTROL_MODE_POSITION_CONTROL)
+        position_layout.addWidget(self.position_radio)
+
+        position_label = QLabel("Position")
+        position_label.setFixedWidth(80)
+        position_layout.addWidget(position_label)
+
+        self.position_slider = CenterZeroSlider(Qt.Horizontal)
+        self.position_slider.setMinimum(-100)  # -10.0 turns
+        self.position_slider.setMaximum(100)   # +10.0 turns
+        self.position_slider.setValue(0)
+        self.position_slider.valueChanged.connect(self.on_position_changed)
+        position_layout.addWidget(self.position_slider)
+
+        self.position_value_label = QLabel("0.0")
+        self.position_value_label.setObjectName("valueDisplay")
+        self.position_value_label.setFixedWidth(80)
+        self.position_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        position_layout.addWidget(self.position_value_label)
+
+        position_unit = QLabel("turns")
+        position_unit.setStyleSheet("color: #a0a0a0;")
+        position_unit.setFixedWidth(50)
+        position_layout.addWidget(position_unit)
+
+        position_limit_label = QLabel("Max:")
+        position_limit_label.setStyleSheet("color: #a0a0a0;")
+        position_layout.addWidget(position_limit_label)
+
+        self.max_position_spinbox = QSpinBox()
+        self.max_position_spinbox.setMinimum(1)
+        self.max_position_spinbox.setMaximum(100)
+        self.max_position_spinbox.setValue(10)
+        self.max_position_spinbox.setSuffix(" t")
+        self.max_position_spinbox.setFixedWidth(70)
+        self.max_position_spinbox.valueChanged.connect(self.on_max_position_changed)
+        position_layout.addWidget(self.max_position_spinbox)
+
+        control_layout.addWidget(self.position_row)
+
+        # === Velocity Control Row ===
+        self.velocity_row = QWidget()
+        velocity_layout = QHBoxLayout(self.velocity_row)
+        velocity_layout.setContentsMargins(5, 5, 5, 5)
+
+        self.velocity_radio = QRadioButton()
+        self.mode_button_group.addButton(self.velocity_radio, CONTROL_MODE_VELOCITY_CONTROL)
+        velocity_layout.addWidget(self.velocity_radio)
 
         velocity_label = QLabel("Velocity")
-        velocity_label.setFixedWidth(100)
+        velocity_label.setFixedWidth(80)
         velocity_layout.addWidget(velocity_label)
 
-        # Slider uses integer values, we'll scale by 10 for 0.1 turns/s resolution
         self.velocity_slider = CenterZeroSlider(Qt.Horizontal)
         self.velocity_slider.setMinimum(-100)  # -10.0 turns/s
         self.velocity_slider.setMaximum(100)   # +10.0 turns/s
@@ -516,38 +683,59 @@ class ODriveGUI(QMainWindow):
 
         velocity_unit = QLabel("turns/s")
         velocity_unit.setStyleSheet("color: #a0a0a0;")
+        velocity_unit.setFixedWidth(50)
         velocity_layout.addWidget(velocity_unit)
 
-        # Max velocity limit
-        limit_label = QLabel("Max:")
-        limit_label.setStyleSheet("color: #a0a0a0;")
-        velocity_layout.addWidget(limit_label)
+        velocity_limit_label = QLabel("Max:")
+        velocity_limit_label.setStyleSheet("color: #a0a0a0;")
+        velocity_layout.addWidget(velocity_limit_label)
 
         self.max_velocity_spinbox = QSpinBox()
         self.max_velocity_spinbox.setMinimum(1)
         self.max_velocity_spinbox.setMaximum(50)
         self.max_velocity_spinbox.setValue(10)
         self.max_velocity_spinbox.setSuffix(" t/s")
-        self.max_velocity_spinbox.setFixedWidth(80)
+        self.max_velocity_spinbox.setFixedWidth(70)
         self.max_velocity_spinbox.valueChanged.connect(self.on_max_velocity_changed)
         velocity_layout.addWidget(self.max_velocity_spinbox)
 
-        control_layout.addLayout(velocity_layout)
+        control_layout.addWidget(self.velocity_row)
 
-        # Measured velocity display
+        # Connect mode button group signal
+        self.mode_button_group.buttonClicked.connect(self.on_mode_changed)
+
+        # Separator line
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setStyleSheet("background-color: #3d3d3d;")
+        control_layout.addWidget(separator)
+
+        # Measured values display
         measured_layout = QHBoxLayout()
         measured_layout.addWidget(QLabel("Measured:"))
+
+        measured_layout.addWidget(QLabel("Pos:"))
+        self.measured_position_label = QLabel("0.00 turns")
+        self.measured_position_label.setStyleSheet("color: #f59e0b; font-weight: bold;")
+        measured_layout.addWidget(self.measured_position_label)
+
+        measured_layout.addWidget(QLabel("   Vel:"))
         self.measured_velocity_label = QLabel("0.0 turns/s")
         self.measured_velocity_label.setStyleSheet("color: #3b82f6; font-weight: bold;")
         measured_layout.addWidget(self.measured_velocity_label)
+
         measured_layout.addWidget(QLabel("   Current:"))
         self.measured_current_label = QLabel("0.00 A")
         self.measured_current_label.setStyleSheet("color: #10b981; font-weight: bold;")
         measured_layout.addWidget(self.measured_current_label)
+
         measured_layout.addStretch()
         control_layout.addLayout(measured_layout)
 
         main_layout.addWidget(control_panel)
+
+        # Apply initial mode highlighting
+        self.update_mode_highlighting()
 
         # === Plot Section ===
         pg.setConfigOptions(antialias=True)
@@ -582,6 +770,7 @@ class ODriveGUI(QMainWindow):
         self.current_plot.setLabel('left', 'Current', units='A')
         self.current_plot.setLabel('bottom', 'Time', units='s')
         self.current_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.current_plot.setYRange(0, 0.5, padding=0)  # Focus on 0-0.5A range
         self.current_curve = self.current_plot.plot(pen=pg.mkPen('#10b981', width=2))
 
     def toggle_connection(self):
@@ -604,8 +793,8 @@ class ODriveGUI(QMainWindow):
             # Make sure motor is in idle state initially
             self.axis.requested_state = AXIS_STATE_IDLE
 
-            # Set up for velocity control
-            self.axis.controller.config.control_mode = CONTROL_MODE_VELOCITY_CONTROL
+            # Set control mode based on current GUI selection
+            self.axis.controller.config.control_mode = self.current_control_mode
 
             serial = hex(self.odrv.serial_number).upper()
             self.status_label.setText(f"Connected: {serial}")
@@ -615,8 +804,9 @@ class ODriveGUI(QMainWindow):
             self.calibrate_btn.setEnabled(True)
             self.clear_errors_btn.setEnabled(True)
 
-            # Start reader thread
+            # Start reader thread with current control mode
             self.reader_thread = ODriveReader(self.odrv, self.axis)
+            self.reader_thread.control_mode = self.current_control_mode
             self.reader_thread.data_received.connect(self.on_data_received)
             self.reader_thread.errors_received.connect(self.on_errors_received)
             self.reader_thread.connection_lost.connect(self.on_connection_lost)
@@ -657,6 +847,16 @@ class ODriveGUI(QMainWindow):
         self.status_msg_label.setText("")
         self.update_error_display(0, 0, 0, 0)  # Clear error display
 
+        # Reset all sliders
+        self.torque_slider.setValue(0)
+        self.position_slider.setValue(0)
+        self.velocity_slider.setValue(0)
+
+        # Reset to default mode (torque)
+        self.torque_radio.setChecked(True)
+        self.current_control_mode = CONTROL_MODE_TORQUE_CONTROL
+        self.update_mode_highlighting()
+
     def on_connection_lost(self):
         """Handle unexpected disconnection"""
         self.disconnect_odrive()
@@ -673,6 +873,8 @@ class ODriveGUI(QMainWindow):
         else:
             # Request idle via background thread
             self.reader_thread.request_state(AXIS_STATE_IDLE)
+            self.torque_slider.setValue(0)
+            self.position_slider.setValue(0)
             self.velocity_slider.setValue(0)
 
     def on_velocity_changed(self, value):
@@ -707,13 +909,139 @@ class ODriveGUI(QMainWindow):
             limited = self.max_velocity_limit if self.commanded_velocity > 0 else -self.max_velocity_limit
             self.velocity_slider.setValue(int(limited * 10))
 
+    def on_torque_changed(self, value):
+        """Torque slider changed"""
+        # Convert from slider units to Amps (scaled by 100 for 0.01A resolution)
+        torque = value / 100.0
+
+        # Enforce limit
+        if abs(torque) > self.max_torque_limit:
+            limited = self.max_torque_limit if torque > 0 else -self.max_torque_limit
+            self.torque_slider.setValue(int(limited * 100))
+            return
+
+        self.commanded_torque = torque
+        self.torque_value_label.setText(f"{torque:.2f}")
+
+        # Send to ODrive via reader thread
+        if self.reader_thread:
+            self.reader_thread.set_torque(torque)
+
+    def on_max_torque_changed(self, value):
+        """Update max torque limit"""
+        self.max_torque_limit = float(value)
+
+        # Update slider range (scaled by 100 for 0.01A resolution)
+        slider_max = int(value * 100)
+        self.torque_slider.setMinimum(-slider_max)
+        self.torque_slider.setMaximum(slider_max)
+
+        # Clamp current value if needed
+        if abs(self.commanded_torque) > self.max_torque_limit:
+            limited = self.max_torque_limit if self.commanded_torque > 0 else -self.max_torque_limit
+            self.torque_slider.setValue(int(limited * 100))
+
+    def on_position_changed(self, value):
+        """Position slider changed"""
+        print(f"[DEBUG] on_position_changed called with value={value}")
+        # Convert from slider units to turns
+        position = value / 10.0
+        print(f"[DEBUG] Position in turns: {position}, limit: {self.max_position_limit}")
+
+        # Enforce limit
+        if abs(position) > self.max_position_limit:
+            limited = self.max_position_limit if position > 0 else -self.max_position_limit
+            print(f"[DEBUG] Position over limit, clamping to {limited}")
+            self.position_slider.setValue(int(limited * 10))
+            return
+
+        self.commanded_position = position
+        self.position_value_label.setText(f"{position:.1f}")
+
+        # Send to ODrive via reader thread
+        if self.reader_thread:
+            print(f"[DEBUG] Sending position {position} to reader thread")
+            self.reader_thread.set_position(position)
+        else:
+            print("[DEBUG] No reader thread available")
+
+    def on_max_position_changed(self, value):
+        """Update max position limit"""
+        self.max_position_limit = float(value)
+
+        # Update slider range
+        slider_max = int(value * 10)
+        self.position_slider.setMinimum(-slider_max)
+        self.position_slider.setMaximum(slider_max)
+
+        # Clamp current value if needed
+        if abs(self.commanded_position) > self.max_position_limit:
+            limited = self.max_position_limit if self.commanded_position > 0 else -self.max_position_limit
+            self.position_slider.setValue(int(limited * 10))
+
+    def on_mode_changed(self, button):
+        """Handle control mode change via radio button"""
+        mode = self.mode_button_group.id(button)
+        print(f"[GUI] Mode changed to: {mode}")
+        self.current_control_mode = mode
+
+        # Update visual highlighting
+        self.update_mode_highlighting()
+
+        # Request mode change in background thread
+        if self.reader_thread:
+            self.reader_thread.request_mode_change(mode)
+
+            # After mode change, sync slider values to current commands
+            # This ensures sliders work immediately after switching modes
+            if mode == CONTROL_MODE_POSITION_CONTROL and hasattr(self, 'position'):
+                # Clamp current position to slider range
+                current_pos = max(-self.max_position_limit,
+                                 min(self.max_position_limit, self.position))
+                self.commanded_position = current_pos
+                self.position_slider.setValue(int(current_pos * 10))
+                self.position_value_label.setText(f"{current_pos:.1f}")
+                # Explicitly send the clamped position to the thread
+                self.reader_thread.set_position(current_pos)
+            elif mode == CONTROL_MODE_TORQUE_CONTROL:
+                # Torque starts at zero
+                self.commanded_torque = 0.0
+                self.torque_slider.setValue(0)
+                self.torque_value_label.setText("0.00")
+                self.reader_thread.set_torque(0.0)
+            elif mode == CONTROL_MODE_VELOCITY_CONTROL:
+                # Velocity starts at zero
+                self.commanded_velocity = 0.0
+                self.velocity_slider.setValue(0)
+                self.velocity_value_label.setText("0.0")
+                self.reader_thread.set_velocity(0.0)
+
+    def update_mode_highlighting(self):
+        """Update visual highlighting of the active control mode row"""
+        # Define styles
+        active_style = "background-color: #2d3d2d; border-radius: 5px;"
+        inactive_style = "background-color: transparent;"
+
+        # Apply styles based on current mode
+        self.torque_row.setStyleSheet(
+            active_style if self.current_control_mode == CONTROL_MODE_TORQUE_CONTROL else inactive_style)
+        self.position_row.setStyleSheet(
+            active_style if self.current_control_mode == CONTROL_MODE_POSITION_CONTROL else inactive_style)
+        self.velocity_row.setStyleSheet(
+            active_style if self.current_control_mode == CONTROL_MODE_VELOCITY_CONTROL else inactive_style)
+
     def emergency_stop(self):
-        """Emergency stop - disable motor and zero velocity"""
+        """Emergency stop - disable motor and zero all commands"""
+        # Zero all sliders
+        self.torque_slider.setValue(0)
+        self.position_slider.setValue(0)
         self.velocity_slider.setValue(0)
         self.enable_checkbox.setChecked(False)
 
         # Request idle via background thread (non-blocking)
         if self.reader_thread:
+            self.reader_thread.set_velocity(0)
+            self.reader_thread.set_torque(0)
             self.reader_thread.request_state(AXIS_STATE_IDLE)
 
     def run_calibration(self):
@@ -723,6 +1051,8 @@ class ODriveGUI(QMainWindow):
 
         # Disable motor control first
         self.enable_checkbox.setChecked(False)
+        self.torque_slider.setValue(0)
+        self.position_slider.setValue(0)
         self.velocity_slider.setValue(0)
         self.calibrate_btn.setEnabled(False)
         self.calibrate_btn.setText("Calibrating...")
@@ -740,6 +1070,8 @@ class ODriveGUI(QMainWindow):
 
         # Disable motor first
         self.enable_checkbox.setChecked(False)
+        self.torque_slider.setValue(0)
+        self.position_slider.setValue(0)
         self.velocity_slider.setValue(0)
 
         # Request clear errors via background thread (non-blocking)
@@ -757,6 +1089,7 @@ class ODriveGUI(QMainWindow):
         self.current_state = current_state
 
         # Update labels
+        self.measured_position_label.setText(f"{position:.2f} turns")
         self.measured_velocity_label.setText(f"{velocity:.1f} turns/s")
         self.measured_current_label.setText(f"{current_iq:.2f} A")
         self.voltage_label.setText(f"{voltage:.1f} V")
