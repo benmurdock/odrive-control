@@ -127,6 +127,7 @@ class ExerciseReader(QThread):
 
     def request_state(self, state):
         """Thread-safe way to request a state change"""
+        print(f"[DEBUG] Requesting state: {state}")
         self.requested_state = state
         if state == AXIS_STATE_CLOSED_LOOP_CONTROL:
             self.enabled = True
@@ -135,10 +136,12 @@ class ExerciseReader(QThread):
 
     def request_clear_errors(self):
         """Thread-safe way to request error clearing"""
+        print("[DEBUG] Requesting clear errors")
         self.clear_errors_requested = True
 
     def run(self):
         """Fast polling loop for exercise mode"""
+        print("[DEBUG] ExerciseReader thread started")
         error_check_counter = 0
         gui_update_counter = 0
 
@@ -148,31 +151,45 @@ class ExerciseReader(QThread):
             try:
                 # Handle pending state change
                 if self.requested_state is not None:
+                    print(f"[DEBUG] Applying state change: {self.requested_state}")
                     self.axis.requested_state = self.requested_state
                     self.requested_state = None
+                    print("[DEBUG] State change applied")
 
                 # Handle clear errors
                 if self.clear_errors_requested:
+                    print("[DEBUG] Clearing errors")
                     self.axis.error = 0
                     self.axis.motor.error = 0
                     self.axis.encoder.error = 0
                     self.axis.controller.error = 0
                     self.clear_errors_requested = False
+                    print("[DEBUG] Errors cleared")
 
-                # Handle current limit change
-                if self.current_limit_changed:
-                    self.axis.motor.config.current_lim = self.current_limit
-                    self.current_limit_changed = False
+                # Read current state first
+                current_state = self.axis.current_state
 
-                # Read current state
+                # During calibration, don't poll - just wait
+                if current_state not in (AXIS_STATE_IDLE, AXIS_STATE_CLOSED_LOOP_CONTROL):
+                    time.sleep(0.5)  # Check state twice per second during calibration
+                    continue
+
+                # Normal operation - read all values
                 position = self.axis.encoder.pos_estimate
                 velocity = self.axis.encoder.vel_estimate
                 current_iq = self.axis.motor.current_control.Iq_measured
                 voltage = self.odrv.vbus_voltage
-                current_state = self.axis.current_state
 
-                # Write position command (always targeting home)
+                # Only modify motor config and send commands when in CLOSED_LOOP
+                # Don't set current_lim while IDLE - it would interfere with calibration
                 if current_state == AXIS_STATE_CLOSED_LOOP_CONTROL:
+                    # Update current limit if needed
+                    if self.current_limit_changed:
+                        print(f"[DEBUG] Setting current_lim to {self.current_limit}")
+                        self.axis.motor.config.current_lim = self.current_limit
+                        self.current_limit_changed = False
+
+                    # Write position command (always targeting home)
                     self.axis.controller.input_pos = self.target_position
 
                 # Throttle GUI updates to ~50Hz
@@ -194,13 +211,16 @@ class ExerciseReader(QThread):
                     )
 
             except Exception as e:
-                print(f"[ERROR] ODrive communication error: {e}")
+                print(f"[DEBUG] ODrive read error: {e}")
                 self.connection_lost.emit()
                 break
 
             time.sleep(0.001)
 
+        print("[DEBUG] ExerciseReader thread stopped")
+
     def stop(self):
+        print("[DEBUG] ExerciseReader stop requested")
         self.running = False
 
 
@@ -563,13 +583,15 @@ class ExerciseGUI(QMainWindow):
             self.odrv = odrive.find_any(timeout=10)
             self.axis = self.odrv.axis0
 
-            # Configure for position control with current limiting
+            # Set to idle state initially
             self.axis.requested_state = AXIS_STATE_IDLE
+
+            # Configure for position control (safe to set before calibration)
             self.axis.controller.config.control_mode = CONTROL_MODE_POSITION_CONTROL
             self.axis.controller.config.input_mode = 1  # PASSTHROUGH
 
-            # Set initial current limit
-            self.axis.motor.config.current_lim = self.current_limit
+            # Note: current_lim will be set by the background thread when in IDLE or CLOSED_LOOP
+            # This avoids interfering with calibration which needs its own current levels
 
             serial = hex(self.odrv.serial_number).upper()
             self.status_label.setText(f"Connected: {serial}")
@@ -583,6 +605,7 @@ class ExerciseGUI(QMainWindow):
             # Start reader thread
             self.reader_thread = ExerciseReader(self.odrv, self.axis)
             self.reader_thread.current_limit = self.current_limit
+            # Note: current_limit_changed stays False - limit will be applied when entering closed-loop
             self.reader_thread.data_received.connect(self.on_data_received)
             self.reader_thread.errors_received.connect(self.on_errors_received)
             self.reader_thread.connection_lost.connect(self.on_connection_lost)
@@ -630,6 +653,8 @@ class ExerciseGUI(QMainWindow):
             return
 
         if state == Qt.Checked:
+            # Apply current limit when entering closed-loop control
+            self.reader_thread.set_current_limit(self.current_limit)
             self.reader_thread.request_state(AXIS_STATE_CLOSED_LOOP_CONTROL)
         else:
             self.reader_thread.request_state(AXIS_STATE_IDLE)
