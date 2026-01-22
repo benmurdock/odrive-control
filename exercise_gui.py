@@ -31,7 +31,7 @@ import pyqtgraph as pg
 import odrive
 from odrive.enums import (AXIS_STATE_IDLE, AXIS_STATE_CLOSED_LOOP_CONTROL,
                           AXIS_STATE_FULL_CALIBRATION_SEQUENCE,
-                          CONTROL_MODE_POSITION_CONTROL)
+                          CONTROL_MODE_TORQUE_CONTROL)
 
 # ODrive error code descriptions (for firmware 0.5.x)
 AXIS_ERRORS = {
@@ -105,25 +105,25 @@ class ExerciseReader(QThread):
         self.axis = axis
         self.running = True
 
-        # Position control target (home position)
-        self.target_position = 0.0  # turns
+        # Home position - the "floor" where the weight rests
+        self.home_position = 0.0  # turns
 
-        # Current limit (simulated weight)
-        self.current_limit = 0.5  # Amps
-        self.current_limit_changed = False
+        # Torque to apply (simulated weight) in Nm
+        self.weight_torque = 0.1  # Nm - torque applied when above home
 
         self.requested_state = None
         self.enabled = False
         self.clear_errors_requested = False
 
-    def set_position(self, position):
+    def set_home_position(self, position):
         """Thread-safe way to update home position"""
-        self.target_position = position
+        self.home_position = position
 
-    def set_current_limit(self, limit):
-        """Thread-safe way to update current limit (weight simulation)"""
-        self.current_limit = limit
-        self.current_limit_changed = True
+    def set_weight_torque(self, torque):
+        """Thread-safe way to update weight torque (Amps)"""
+        print(f"[DEBUG] Weight torque updated to {torque:.3f} A")
+        self.weight_torque = torque #TORQUE SET HEREodrv0.axis0.controller.config.input_mode
+
 
     def request_state(self, state):
         """Thread-safe way to request a state change"""
@@ -180,17 +180,19 @@ class ExerciseReader(QThread):
                 current_iq = self.axis.motor.current_control.Iq_measured
                 voltage = self.odrv.vbus_voltage
 
-                # Only modify motor config and send commands when in CLOSED_LOOP
-                # Don't set current_lim while IDLE - it would interfere with calibration
+                # Apply torque control when in closed loop
                 if current_state == AXIS_STATE_CLOSED_LOOP_CONTROL:
-                    # Update current limit if needed
-                    if self.current_limit_changed:
-                        print(f"[DEBUG] Setting current_lim to {self.current_limit}")
-                        self.axis.motor.config.current_lim = self.current_limit
-                        self.current_limit_changed = False
+                    # Apply torque when below home (position is negative), zero when at or above
+                    if position < self.home_position:
+                        torque_cmd = self.weight_torque #ben
+                    else:
+                        torque_cmd = 0.0
 
-                    # Write position command (always targeting home)
-                    self.axis.controller.input_pos = self.target_position
+                    self.axis.controller.input_torque = torque_cmd
+
+                    # Debug: print torque command periodically (every ~1 second)
+                    if gui_update_counter == 0:
+                        print(f"[DEBUG] pos={position:.3f}, home={self.home_position:.3f}, torque_cmd={torque_cmd:.3f} Nm")
 
                 # Throttle GUI updates to ~50Hz
                 gui_update_counter += 1
@@ -248,7 +250,7 @@ class ExerciseGUI(QMainWindow):
         self.current_iq = 0.0
         self.voltage = 0.0
         self.home_position = 0.0  # Where the "weight" wants to return to
-        self.current_limit = 0.5  # Simulated weight in Amps
+        self.weight_torque = 0.1  # Simulated weight in Nm
 
         # Error tracking
         self.has_errors = False
@@ -440,16 +442,16 @@ class ExerciseGUI(QMainWindow):
         # Weight (current limit) setting
         weight_layout = QHBoxLayout()
 
-        weight_label = QLabel("Simulated Weight (Current Limit):")
+        weight_label = QLabel("Simulated Weight (Torque):")
         weight_label.setStyleSheet("font-size: 12pt;")
         weight_layout.addWidget(weight_label)
 
         self.weight_input = QDoubleSpinBox()
-        self.weight_input.setRange(0.01, 20.0)
-        self.weight_input.setValue(0.5)
+        self.weight_input.setRange(0.01, 5.0)
+        self.weight_input.setValue(0.1)
         self.weight_input.setSingleStep(0.1)
         self.weight_input.setDecimals(2)
-        self.weight_input.setSuffix(" A")
+        self.weight_input.setSuffix(" Nm")
         self.weight_input.setFixedWidth(120)
         self.weight_input.valueChanged.connect(self.on_weight_changed)
         weight_layout.addWidget(self.weight_input)
@@ -586,12 +588,8 @@ class ExerciseGUI(QMainWindow):
             # Set to idle state initially
             self.axis.requested_state = AXIS_STATE_IDLE
 
-            # Configure for position control (safe to set before calibration)
-            self.axis.controller.config.control_mode = CONTROL_MODE_POSITION_CONTROL
-            self.axis.controller.config.input_mode = 1  # PASSTHROUGH
-
-            # Note: current_lim will be set by the background thread when in IDLE or CLOSED_LOOP
-            # This avoids interfering with calibration which needs its own current levels
+            # Note: control_mode and input_mode are set when enabling the motor
+            # to avoid interfering with calibration
 
             serial = hex(self.odrv.serial_number).upper()
             self.status_label.setText(f"Connected: {serial}")
@@ -604,8 +602,8 @@ class ExerciseGUI(QMainWindow):
 
             # Start reader thread
             self.reader_thread = ExerciseReader(self.odrv, self.axis)
-            self.reader_thread.current_limit = self.current_limit
-            # Note: current_limit_changed stays False - limit will be applied when entering closed-loop
+            self.reader_thread.weight_torque = self.weight_torque
+            self.reader_thread.home_position = self.home_position
             self.reader_thread.data_received.connect(self.on_data_received)
             self.reader_thread.errors_received.connect(self.on_errors_received)
             self.reader_thread.connection_lost.connect(self.on_connection_lost)
@@ -653,17 +651,18 @@ class ExerciseGUI(QMainWindow):
             return
 
         if state == Qt.Checked:
-            # Apply current limit when entering closed-loop control
-            self.reader_thread.set_current_limit(self.current_limit)
+            # Configure for torque control before entering closed loop
+            self.axis.controller.config.control_mode = CONTROL_MODE_TORQUE_CONTROL
+            self.axis.controller.config.input_mode = 1  # INPUT_MODE_PASSTHROUGH
             self.reader_thread.request_state(AXIS_STATE_CLOSED_LOOP_CONTROL)
         else:
             self.reader_thread.request_state(AXIS_STATE_IDLE)
 
     def on_weight_changed(self, value):
-        """Update the simulated weight (current limit)"""
-        self.current_limit = value
+        """Update the simulated weight (torque in Nm)"""
+        self.weight_torque = value
         if self.reader_thread:
-            self.reader_thread.set_current_limit(value)
+            self.reader_thread.set_weight_torque(value)
 
     def set_zero_position(self):
         """Set current position as home (zero) position"""
@@ -671,7 +670,7 @@ class ExerciseGUI(QMainWindow):
         self.home_display.setText(f"{self.home_position:.2f}")
 
         if self.reader_thread:
-            self.reader_thread.set_position(self.home_position)
+            self.reader_thread.set_home_position(self.home_position)
 
         self.status_msg_label.setText(f"Home set to {self.home_position:.2f} turns")
         self.status_msg_label.setStyleSheet("color: #8b5cf6;")
