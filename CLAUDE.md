@@ -35,9 +35,41 @@ if self.requested_state is not None:
 High-frequency signal emissions overwhelm the Qt event queue - always throttle.
 
 ## Key Files
-- `odrive_gui.py` - Main GUI application with ODriveReader thread
+- `exercise_gui.py` - Main exercise machine GUI (load-side units: lbs, inches)
+- `cable_geometry.py` - Geometry conversions between motor and load domains
+- `odrive_gui.py` - Low-level motor test GUI (raw motor units)
 - `main.py` - Simple connection test script
 - `91-odrive.rules` - udev rules for USB permissions
+
+## Cable Geometry
+
+The system uses a V-pulley configuration:
+```
+        [Load point]
+           /\
+          /  \
+         / h  \     h = 24" to 80" above pulleys
+        /      \
+   [P1]──48"──[P2]  Pulleys 24" from center each
+       ↓       ↓
+      (both cables to single 1.5" spool)
+```
+
+Key relationships (in `cable_geometry.py`):
+- `sin(θ) = h / sqrt(576 + h²)` - cable angle factor
+- Force: `motor_torque = load_force * spool_radius / (2 * sin(θ))`
+- Position: `cable_length = 2 * sqrt(576 + h²)`
+
+At lower heights, cables are at steeper angles → need more motor torque per lb.
+At higher heights, cables are more vertical → need less motor torque per lb.
+
+### Calibration
+User enters current height in inches, clicks "Set" to sync encoder position.
+The geometry module uses this reference to convert all positions.
+
+### Motor Direction
+`motor_direction` parameter in CableGeometry (+1 or -1) handles motor mounting direction.
+When adding second motor (opposite mounting), set its direction to -1.
 
 ## Lessons Learned
 
@@ -54,9 +86,10 @@ High-frequency signal emissions overwhelm the Qt event queue - always throttle.
 - Error codes are bitmasks - decode with bitwise AND
 
 ## Next Steps
-- Add axis1 support (extend ODriveReader to handle both axes in single loop)
-- Switch from velocity to torque control mode
-- Implement position-dependent torque logic
+- Add animated diagram to represent load position
+- Add axis1 support (extend ExerciseReader to handle both axes)
+- Add velocity/position control modes in load-side units
+- Test force compensation at different heights
 
 ## User Notes
 Ben is a "late beginner" programmer - explain changes and walk through code.

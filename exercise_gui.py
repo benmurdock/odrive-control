@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
 """
-Exercise Machine Simulator GUI
+Exercise Machine GUI - V-Pulley Cable System
 
-Simulates a weight on a cable using ODrive position control with current limiting.
-The motor tries to return to a "home" position but is limited to a maximum current,
-creating the feel of lifting and lowering a weight.
+Controls an ODrive motor connected to a cable system with the following geometry:
+- Two pulleys spaced 48" apart horizontally
+- Both cables wind on a single 1.5" diameter spool
+- Load attachment point moves vertically from 24" to 80" above pulleys
+
+The GUI operates in load-side units:
+- Force in pounds (lbs)
+- Height in inches
+- Motor stats shown for debugging
 
 Control paradigm:
-- Position control mode with input_pos = home position
-- current_lim sets the maximum force (simulated weight)
-- Motor resists movement up to current_lim, then allows backdriving
+- Torque control mode with force conversion based on cable geometry
+- When load is below "home height", motor applies constant vertical force
+- When load is at or above home height, motor applies zero force (freewheel)
+
+Calibration:
+- Enter the current load height and click "Set" to sync with encoder
+- The geometry module handles all motor <-> load unit conversions
 
 Requirements:
 pip install odrive PyQt5 pyqtgraph
@@ -32,6 +42,7 @@ import odrive
 from odrive.enums import (AXIS_STATE_IDLE, AXIS_STATE_CLOSED_LOOP_CONTROL,
                           AXIS_STATE_FULL_CALIBRATION_SEQUENCE,
                           CONTROL_MODE_TORQUE_CONTROL)
+from cable_geometry import CableGeometry
 
 # ODrive error code descriptions (for firmware 0.5.x)
 AXIS_ERRORS = {
@@ -93,36 +104,37 @@ def decode_errors(error_code, error_dict):
 
 class ExerciseReader(QThread):
     """Background thread for ODrive communication in exercise mode"""
-    # Signal: position (turns), velocity (turns/s), current Iq (A), voltage (V), loop_time (ms), current_state (int)
-    data_received = pyqtSignal(float, float, float, float, float, int)
+    # Signal: motor_pos (turns), motor_vel (turns/s), current Iq (A), voltage (V), loop_time (ms), current_state (int), load_height (in)
+    data_received = pyqtSignal(float, float, float, float, float, int, float)
     # Signal: axis_error, motor_error, encoder_error, controller_error
     errors_received = pyqtSignal(int, int, int, int)
     connection_lost = pyqtSignal()
 
-    def __init__(self, odrv, axis):
+    def __init__(self, odrv, axis, geometry):
         super().__init__()
         self.odrv = odrv
         self.axis = axis
+        self.geometry = geometry
         self.running = True
 
-        # Home position - the "floor" where the weight rests
-        self.home_position = 0.0  # turns
+        # Home height - the "floor" where the weight rests (in inches)
+        self.home_height = 24.0  # inches (at pulley level minimum)
 
-        # Torque to apply (simulated weight) in Nm
-        self.weight_torque = 0.1  # Nm - torque applied when above home
+        # Load force to apply (simulated weight) in pounds
+        self.load_force_lbs = 5.0  # lbs - force applied when below home height
 
         self.requested_state = None
         self.enabled = False
         self.clear_errors_requested = False
 
-    def set_home_position(self, position):
-        """Thread-safe way to update home position"""
-        self.home_position = position
+    def set_home_height(self, height_inches):
+        """Thread-safe way to update home height in inches"""
+        self.home_height = height_inches
 
-    def set_weight_torque(self, torque):
-        """Thread-safe way to update weight torque (Amps)"""
-        print(f"[DEBUG] Weight torque updated to {torque:.3f} A")
-        self.weight_torque = torque #TORQUE SET HEREodrv0.axis0.controller.config.input_mode
+    def set_load_force(self, force_lbs):
+        """Thread-safe way to update load force in pounds"""
+        print(f"[DEBUG] Load force updated to {force_lbs:.1f} lbs")
+        self.load_force_lbs = force_lbs
 
 
     def request_state(self, state):
@@ -175,31 +187,38 @@ class ExerciseReader(QThread):
                     continue
 
                 # Normal operation - read all values
-                position = self.axis.encoder.pos_estimate
-                velocity = self.axis.encoder.vel_estimate
+                motor_position = self.axis.encoder.pos_estimate
+                motor_velocity = self.axis.encoder.vel_estimate
                 current_iq = self.axis.motor.current_control.Iq_measured
                 voltage = self.odrv.vbus_voltage
 
+                # Convert motor position to load height using geometry
+                load_height = self.geometry.motor_turns_to_height(motor_position)
+
                 # Apply torque control when in closed loop
                 if current_state == AXIS_STATE_CLOSED_LOOP_CONTROL:
-                    # Apply torque when below home (position is negative), zero when at or above
-                    if position < self.home_position:
-                        torque_cmd = self.weight_torque #ben
+                    # Apply force when below home height, zero when at or above
+                    if load_height < self.home_height:
+                        # Convert desired load force (lbs) to motor torque (Nm)
+                        torque_cmd = self.geometry.load_force_to_motor_torque(
+                            self.load_force_lbs, load_height)
                     else:
                         torque_cmd = 0.0
 
                     self.axis.controller.input_torque = torque_cmd
 
-                    # Debug: print torque command periodically (every ~1 second)
+                    # Debug: print command periodically (every ~1 second)
                     if gui_update_counter == 0:
-                        print(f"[DEBUG] pos={position:.3f}, home={self.home_position:.3f}, torque_cmd={torque_cmd:.3f} Nm")
+                        print(f"[DEBUG] height={load_height:.1f}in, home={self.home_height:.1f}in, "
+                              f"force={self.load_force_lbs:.1f}lbs, torque={torque_cmd:.3f}Nm")
 
                 # Throttle GUI updates to ~50Hz
                 gui_update_counter += 1
                 if gui_update_counter >= 20:
                     gui_update_counter = 0
                     loop_time = (time.perf_counter() - loop_start) * 1000
-                    self.data_received.emit(position, velocity, current_iq, voltage, loop_time, current_state)
+                    self.data_received.emit(motor_position, motor_velocity, current_iq, voltage,
+                                            loop_time, current_state, load_height)
 
                 # Check errors less frequently
                 error_check_counter += 1
@@ -229,8 +248,11 @@ class ExerciseReader(QThread):
 class ExerciseGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Exercise Machine Simulator")
-        self.setGeometry(100, 100, 900, 700)
+        self.setWindowTitle("Exercise Machine - Cable System")
+        self.setGeometry(100, 100, 1000, 800)
+
+        # Cable geometry for unit conversions
+        self.geometry = CableGeometry(motor_direction=1)
 
         # ODrive connection
         self.odrv = None
@@ -240,17 +262,20 @@ class ExerciseGUI(QMainWindow):
         # Data buffers for plotting
         self.max_points = 1000
         self.time_data = deque(maxlen=self.max_points)
-        self.position_data = deque(maxlen=self.max_points)
+        self.height_data = deque(maxlen=self.max_points)  # Load height in inches
         self.current_data = deque(maxlen=self.max_points)
         self.start_time = None
 
-        # State
-        self.position = 0.0
-        self.velocity = 0.0
-        self.current_iq = 0.0
-        self.voltage = 0.0
-        self.home_position = 0.0  # Where the "weight" wants to return to
-        self.weight_torque = 0.1  # Simulated weight in Nm
+        # Motor state (raw values from ODrive)
+        self.motor_position = 0.0  # turns
+        self.motor_velocity = 0.0  # turns/sec
+        self.current_iq = 0.0  # amps
+        self.voltage = 0.0  # volts
+
+        # Load state (converted via geometry)
+        self.load_height = 24.0  # inches
+        self.home_height = 24.0  # inches - where the "weight" wants to return to
+        self.load_force_lbs = 5.0  # lbs - simulated weight force
 
         # Error tracking
         self.has_errors = False
@@ -439,33 +464,52 @@ class ExerciseGUI(QMainWindow):
         separator1.setStyleSheet("background-color: #3d3d3d;")
         control_layout.addWidget(separator1)
 
-        # Weight (current limit) setting
-        weight_layout = QHBoxLayout()
+        # Height calibration row
+        height_cal_layout = QHBoxLayout()
 
-        weight_label = QLabel("Simulated Weight (Torque):")
-        weight_label.setStyleSheet("font-size: 12pt;")
-        weight_layout.addWidget(weight_label)
+        height_cal_label = QLabel("Current Height:")
+        height_cal_label.setStyleSheet("font-size: 12pt;")
+        height_cal_layout.addWidget(height_cal_label)
 
-        self.weight_input = QDoubleSpinBox()
-        self.weight_input.setRange(0.01, 5.0)
-        self.weight_input.setValue(0.1)
-        self.weight_input.setSingleStep(0.1)
-        self.weight_input.setDecimals(2)
-        self.weight_input.setSuffix(" Nm")
-        self.weight_input.setFixedWidth(120)
-        self.weight_input.valueChanged.connect(self.on_weight_changed)
-        weight_layout.addWidget(self.weight_input)
+        self.height_input = QLineEdit()
+        self.height_input.setPlaceholderText("inches")
+        self.height_input.setFixedWidth(80)
+        self.height_input.setValidator(QDoubleValidator(24.0, 80.0, 1))
+        height_cal_layout.addWidget(self.height_input)
 
-        weight_layout.addStretch()
+        self.set_height_btn = QPushButton("Set")
+        self.set_height_btn.setStyleSheet("background-color: #2563eb; border: 1px solid #3b82f6;")
+        self.set_height_btn.clicked.connect(self.on_set_height)
+        self.set_height_btn.setEnabled(False)
+        height_cal_layout.addWidget(self.set_height_btn)
 
-        # Zero button
-        self.zero_btn = QPushButton("Set Zero (Home)")
-        self.zero_btn.setObjectName("zeroButton")
-        self.zero_btn.clicked.connect(self.set_zero_position)
-        self.zero_btn.setEnabled(False)
-        weight_layout.addWidget(self.zero_btn)
+        height_cal_layout.addSpacing(30)
 
-        control_layout.addLayout(weight_layout)
+        # Load force setting
+        force_label = QLabel("Load Force:")
+        force_label.setStyleSheet("font-size: 12pt;")
+        height_cal_layout.addWidget(force_label)
+
+        self.force_input = QDoubleSpinBox()
+        self.force_input.setRange(0.5, 100.0)
+        self.force_input.setValue(5.0)
+        self.force_input.setSingleStep(1.0)
+        self.force_input.setDecimals(1)
+        self.force_input.setSuffix(" lbs")
+        self.force_input.setFixedWidth(100)
+        self.force_input.valueChanged.connect(self.on_force_changed)
+        height_cal_layout.addWidget(self.force_input)
+
+        height_cal_layout.addStretch()
+
+        # Home height button
+        self.set_home_btn = QPushButton("Set Home Height")
+        self.set_home_btn.setObjectName("zeroButton")
+        self.set_home_btn.clicked.connect(self.set_home_position)
+        self.set_home_btn.setEnabled(False)
+        height_cal_layout.addWidget(self.set_home_btn)
+
+        control_layout.addLayout(height_cal_layout)
 
         # Separator
         separator2 = QFrame()
@@ -473,34 +517,34 @@ class ExerciseGUI(QMainWindow):
         separator2.setStyleSheet("background-color: #3d3d3d;")
         control_layout.addWidget(separator2)
 
-        # Measured values display
+        # Measured values display - Load side
         measured_layout = QHBoxLayout()
 
-        # Position display
-        pos_container = QVBoxLayout()
-        pos_label = QLabel("Position")
-        pos_label.setStyleSheet("color: #a0a0a0;")
-        pos_label.setAlignment(Qt.AlignCenter)
-        pos_container.addWidget(pos_label)
+        # Load Height display
+        height_container = QVBoxLayout()
+        height_label = QLabel("Load Height")
+        height_label.setStyleSheet("color: #a0a0a0;")
+        height_label.setAlignment(Qt.AlignCenter)
+        height_container.addWidget(height_label)
 
-        self.position_display = QLabel("0.00")
-        self.position_display.setObjectName("valueDisplay")
-        self.position_display.setStyleSheet("color: #f59e0b; font-size: 24pt;")
-        self.position_display.setAlignment(Qt.AlignCenter)
-        pos_container.addWidget(self.position_display)
+        self.height_display = QLabel("24.0")
+        self.height_display.setObjectName("valueDisplay")
+        self.height_display.setStyleSheet("color: #f59e0b; font-size: 24pt;")
+        self.height_display.setAlignment(Qt.AlignCenter)
+        height_container.addWidget(self.height_display)
 
-        pos_unit = QLabel("turns from home")
-        pos_unit.setStyleSheet("color: #a0a0a0;")
-        pos_unit.setAlignment(Qt.AlignCenter)
-        pos_container.addWidget(pos_unit)
+        height_unit = QLabel("inches")
+        height_unit.setStyleSheet("color: #a0a0a0;")
+        height_unit.setAlignment(Qt.AlignCenter)
+        height_container.addWidget(height_unit)
 
-        measured_layout.addLayout(pos_container)
+        measured_layout.addLayout(height_container)
 
         measured_layout.addStretch()
 
-        # Current display
+        # Current display (motor side, but useful feedback)
         current_container = QVBoxLayout()
-        current_label = QLabel("Current (Force)")
+        current_label = QLabel("Motor Current")
         current_label.setStyleSheet("color: #a0a0a0;")
         current_label.setAlignment(Qt.AlignCenter)
         current_container.addWidget(current_label)
@@ -520,20 +564,20 @@ class ExerciseGUI(QMainWindow):
 
         measured_layout.addStretch()
 
-        # Home position display
+        # Home height display
         home_container = QVBoxLayout()
-        home_label = QLabel("Home Position")
+        home_label = QLabel("Home Height")
         home_label.setStyleSheet("color: #a0a0a0;")
         home_label.setAlignment(Qt.AlignCenter)
         home_container.addWidget(home_label)
 
-        self.home_display = QLabel("0.00")
+        self.home_display = QLabel("24.0")
         self.home_display.setObjectName("valueDisplay")
         self.home_display.setStyleSheet("color: #8b5cf6; font-size: 24pt;")
         self.home_display.setAlignment(Qt.AlignCenter)
         home_container.addWidget(self.home_display)
 
-        home_unit = QLabel("turns (absolute)")
+        home_unit = QLabel("inches")
         home_unit.setStyleSheet("color: #a0a0a0;")
         home_unit.setAlignment(Qt.AlignCenter)
         home_container.addWidget(home_unit)
@@ -541,6 +585,34 @@ class ExerciseGUI(QMainWindow):
         measured_layout.addLayout(home_container)
 
         control_layout.addLayout(measured_layout)
+
+        # Separator for motor stats
+        separator3 = QFrame()
+        separator3.setFrameShape(QFrame.HLine)
+        separator3.setStyleSheet("background-color: #3d3d3d;")
+        control_layout.addWidget(separator3)
+
+        # Motor stats (raw values for debugging)
+        motor_stats_layout = QHBoxLayout()
+        motor_stats_label = QLabel("Motor Stats:")
+        motor_stats_label.setStyleSheet("color: #666666; font-size: 10pt;")
+        motor_stats_layout.addWidget(motor_stats_label)
+
+        self.motor_pos_label = QLabel("Pos: 0.00 turns")
+        self.motor_pos_label.setStyleSheet("color: #666666; font-size: 10pt;")
+        motor_stats_layout.addWidget(self.motor_pos_label)
+
+        self.motor_vel_label = QLabel("Vel: 0.0 t/s")
+        self.motor_vel_label.setStyleSheet("color: #666666; font-size: 10pt;")
+        motor_stats_layout.addWidget(self.motor_vel_label)
+
+        self.mech_adv_label = QLabel("MA: 1.00")
+        self.mech_adv_label.setStyleSheet("color: #666666; font-size: 10pt;")
+        motor_stats_layout.addWidget(self.mech_adv_label)
+
+        motor_stats_layout.addStretch()
+
+        control_layout.addLayout(motor_stats_layout)
 
         main_layout.addWidget(control_panel)
 
@@ -553,13 +625,13 @@ class ExerciseGUI(QMainWindow):
         self.plot_widget.setBackground('#1e1e1e')
         main_layout.addWidget(self.plot_widget)
 
-        # Position plot (relative to home)
-        self.position_plot = self.plot_widget.addPlot(
-            title="<span style='color: #e0e0e0;'>Position (from home)</span>")
-        self.position_plot.setLabel('left', 'Position', units='turns')
-        self.position_plot.setLabel('bottom', 'Time', units='s')
-        self.position_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.position_curve = self.position_plot.plot(pen=pg.mkPen('#f59e0b', width=2))
+        # Height plot
+        self.height_plot = self.plot_widget.addPlot(
+            title="<span style='color: #e0e0e0;'>Load Height</span>")
+        self.height_plot.setLabel('left', 'Height', units='inches')
+        self.height_plot.setLabel('bottom', 'Time', units='s')
+        self.height_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.height_curve = self.height_plot.plot(pen=pg.mkPen('#f59e0b', width=2))
 
         # Current plot
         self.plot_widget.nextRow()
@@ -597,13 +669,14 @@ class ExerciseGUI(QMainWindow):
             self.connect_btn.setText("Disconnect")
             self.enable_checkbox.setEnabled(True)
             self.calibrate_btn.setEnabled(True)
-            self.zero_btn.setEnabled(True)
+            self.set_height_btn.setEnabled(True)
+            self.set_home_btn.setEnabled(True)
             self.clear_errors_btn.setEnabled(True)
 
-            # Start reader thread
-            self.reader_thread = ExerciseReader(self.odrv, self.axis)
-            self.reader_thread.weight_torque = self.weight_torque
-            self.reader_thread.home_position = self.home_position
+            # Start reader thread with geometry
+            self.reader_thread = ExerciseReader(self.odrv, self.axis, self.geometry)
+            self.reader_thread.load_force_lbs = self.load_force_lbs
+            self.reader_thread.home_height = self.home_height
             self.reader_thread.data_received.connect(self.on_data_received)
             self.reader_thread.errors_received.connect(self.on_errors_received)
             self.reader_thread.connection_lost.connect(self.on_connection_lost)
@@ -636,7 +709,8 @@ class ExerciseGUI(QMainWindow):
         self.enable_checkbox.setEnabled(False)
         self.enable_checkbox.setChecked(False)
         self.calibrate_btn.setEnabled(False)
-        self.zero_btn.setEnabled(False)
+        self.set_height_btn.setEnabled(False)
+        self.set_home_btn.setEnabled(False)
         self.clear_errors_btn.setEnabled(False)
         self.clear_errors_btn.setVisible(False)
         self.status_msg_label.setText("")
@@ -658,21 +732,40 @@ class ExerciseGUI(QMainWindow):
         else:
             self.reader_thread.request_state(AXIS_STATE_IDLE)
 
-    def on_weight_changed(self, value):
-        """Update the simulated weight (torque in Nm)"""
-        self.weight_torque = value
+    def on_force_changed(self, value):
+        """Update the load force in pounds"""
+        self.load_force_lbs = value
         if self.reader_thread:
-            self.reader_thread.set_weight_torque(value)
+            self.reader_thread.set_load_force(value)
 
-    def set_zero_position(self):
-        """Set current position as home (zero) position"""
-        self.home_position = self.position
-        self.home_display.setText(f"{self.home_position:.2f}")
+    def on_set_height(self):
+        """Set the current height calibration from user input"""
+        try:
+            height = float(self.height_input.text())
+            if 24.0 <= height <= 80.0:
+                # Update geometry reference with current motor position
+                self.geometry.set_reference(height, self.motor_position)
+                self.load_height = height
+                self.height_display.setText(f"{height:.1f}")
+                self.status_msg_label.setText(f"Height calibrated to {height:.1f} inches")
+                self.status_msg_label.setStyleSheet("color: #14b8a6;")
+                self.height_input.clear()
+            else:
+                self.status_msg_label.setText("Height must be 24-80 inches")
+                self.status_msg_label.setStyleSheet("color: #ef4444;")
+        except ValueError:
+            self.status_msg_label.setText("Enter a valid number")
+            self.status_msg_label.setStyleSheet("color: #ef4444;")
+
+    def set_home_position(self):
+        """Set current height as home (floor) height"""
+        self.home_height = self.load_height
+        self.home_display.setText(f"{self.home_height:.1f}")
 
         if self.reader_thread:
-            self.reader_thread.set_home_position(self.home_position)
+            self.reader_thread.set_home_height(self.home_height)
 
-        self.status_msg_label.setText(f"Home set to {self.home_position:.2f} turns")
+        self.status_msg_label.setText(f"Home set to {self.home_height:.1f} inches")
         self.status_msg_label.setStyleSheet("color: #8b5cf6;")
 
     def emergency_stop(self):
@@ -703,18 +796,27 @@ class ExerciseGUI(QMainWindow):
         self.status_msg_label.setText("Errors cleared - recalibrate!")
         self.status_msg_label.setStyleSheet("color: #f59e0b;")
 
-    def on_data_received(self, position, velocity, current_iq, voltage, loop_time, current_state):
-        self.position = position
-        self.velocity = velocity
+    def on_data_received(self, motor_pos, motor_vel, current_iq, voltage, loop_time, current_state, load_height):
+        # Store motor values
+        self.motor_position = motor_pos
+        self.motor_velocity = motor_vel
         self.current_iq = current_iq
         self.voltage = voltage
         self.current_state = current_state
 
-        # Update displays (position relative to home)
-        relative_pos = position - self.home_position
-        self.position_display.setText(f"{relative_pos:.2f}")
+        # Store load values
+        self.load_height = load_height
+
+        # Update load displays
+        self.height_display.setText(f"{load_height:.1f}")
         self.current_display.setText(f"{abs(current_iq):.2f}")
         self.voltage_label.setText(f"{voltage:.1f} V")
+
+        # Update motor stats
+        self.motor_pos_label.setText(f"Pos: {motor_pos:.2f} turns")
+        self.motor_vel_label.setText(f"Vel: {motor_vel:.1f} t/s")
+        mech_adv = self.geometry.get_mechanical_advantage(load_height)
+        self.mech_adv_label.setText(f"MA: {mech_adv:.2f}")
 
         # Check calibration status
         if self.calibrating and current_state == AXIS_STATE_IDLE:
@@ -729,11 +831,11 @@ class ExerciseGUI(QMainWindow):
                 self.status_msg_label.setText("Calibration complete!")
                 self.status_msg_label.setStyleSheet("color: #14b8a6;")
 
-        # Store for plotting (position relative to home)
+        # Store for plotting
         if self.start_time:
             t = time.time() - self.start_time
             self.time_data.append(t)
-            self.position_data.append(relative_pos)
+            self.height_data.append(load_height)
             self.current_data.append(current_iq)
 
     def on_errors_received(self, axis_error, motor_error, encoder_error, controller_error):
@@ -783,12 +885,12 @@ class ExerciseGUI(QMainWindow):
         time_list = list(self.time_data)
         current_time = time_list[-1]
 
-        self.position_curve.setData(time_list, list(self.position_data))
+        self.height_curve.setData(time_list, list(self.height_data))
         self.current_curve.setData(time_list, list(self.current_data))
 
         # Auto-range X to show last 10 seconds
         x_range = [max(0, current_time - 10), current_time]
-        self.position_plot.setXRange(*x_range, padding=0)
+        self.height_plot.setXRange(*x_range, padding=0)
         self.current_plot.setXRange(*x_range, padding=0)
 
     def closeEvent(self, event):
