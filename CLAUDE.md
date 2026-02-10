@@ -86,7 +86,6 @@ When adding second motor (opposite mounting), set its direction to -1.
 - Error codes are bitmasks - decode with bitwise AND
 
 ## Next Steps
-- Add animated diagram to represent load position
 - Add axis1 support (extend ExerciseReader to handle both axes)
 - Add velocity/position control modes in load-side units
 - Test force compensation at different heights

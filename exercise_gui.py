@@ -104,16 +104,17 @@ def decode_errors(error_code, error_dict):
 
 class ExerciseReader(QThread):
     """Background thread for ODrive communication in exercise mode"""
-    # Signal: motor_pos (turns), motor_vel (turns/s), current Iq (A), voltage (V), loop_time (ms), current_state (int), load_height (in)
-    data_received = pyqtSignal(float, float, float, float, float, int, float)
+    # Signal: motor_pos (turns), motor_vel (turns/s), current Iq (A), voltage (V), loop_time (ms), axis0_state (int), axis1_state (int), load_height (in)
+    data_received = pyqtSignal(float, float, float, float, float, int, int, float)
     # Signal: axis_error, motor_error, encoder_error, controller_error
     errors_received = pyqtSignal(int, int, int, int)
     connection_lost = pyqtSignal()
 
-    def __init__(self, odrv, axis, geometry):
+    def __init__(self, odrv, axis, axis1, geometry):
         super().__init__()
         self.odrv = odrv
         self.axis = axis
+        self.axis1 = axis1
         self.geometry = geometry
         self.running = True
 
@@ -124,6 +125,7 @@ class ExerciseReader(QThread):
         self.load_force_lbs = 5.0  # lbs - force applied when below home height
 
         self.requested_state = None
+        self.requested_state_axis1 = None
         self.enabled = False
         self.clear_errors_requested = False
 
@@ -138,13 +140,18 @@ class ExerciseReader(QThread):
 
 
     def request_state(self, state):
-        """Thread-safe way to request a state change"""
-        print(f"[DEBUG] Requesting state: {state}")
+        """Thread-safe way to request a state change for axis0"""
+        print(f"[DEBUG] Requesting axis0 state: {state}")
         self.requested_state = state
         if state == AXIS_STATE_CLOSED_LOOP_CONTROL:
             self.enabled = True
         elif state == AXIS_STATE_IDLE:
             self.enabled = False
+
+    def request_state_axis1(self, state):
+        """Thread-safe way to request a state change for axis1"""
+        print(f"[DEBUG] Requesting axis1 state: {state}")
+        self.requested_state_axis1 = state
 
     def request_clear_errors(self):
         """Thread-safe way to request error clearing"""
@@ -161,12 +168,19 @@ class ExerciseReader(QThread):
             loop_start = time.perf_counter()
 
             try:
-                # Handle pending state change
+                # Handle pending state change for axis0
                 if self.requested_state is not None:
-                    print(f"[DEBUG] Applying state change: {self.requested_state}")
+                    print(f"[DEBUG] Applying axis0 state change: {self.requested_state}")
                     self.axis.requested_state = self.requested_state
                     self.requested_state = None
-                    print("[DEBUG] State change applied")
+                    print("[DEBUG] Axis0 state change applied")
+
+                # Handle pending state change for axis1
+                if self.requested_state_axis1 is not None:
+                    print(f"[DEBUG] Applying axis1 state change: {self.requested_state_axis1}")
+                    self.axis1.requested_state = self.requested_state_axis1
+                    self.requested_state_axis1 = None
+                    print("[DEBUG] Axis1 state change applied")
 
                 # Handle clear errors
                 if self.clear_errors_requested:
@@ -178,11 +192,18 @@ class ExerciseReader(QThread):
                     self.clear_errors_requested = False
                     print("[DEBUG] Errors cleared")
 
-                # Read current state first
+                # Read current state for both axes
                 current_state = self.axis.current_state
+                current_state_axis1 = self.axis1.current_state
 
                 # During calibration, don't poll - just wait
-                if current_state not in (AXIS_STATE_IDLE, AXIS_STATE_CLOSED_LOOP_CONTROL):
+                # Check if either axis is calibrating
+                axis0_busy = current_state not in (AXIS_STATE_IDLE, AXIS_STATE_CLOSED_LOOP_CONTROL)
+                axis1_busy = current_state_axis1 not in (AXIS_STATE_IDLE, AXIS_STATE_CLOSED_LOOP_CONTROL)
+                if axis0_busy or axis1_busy:
+                    # Still emit state updates during calibration so GUI can track progress
+                    self.data_received.emit(0, 0, 0, self.odrv.vbus_voltage,
+                                            0, current_state, current_state_axis1, 24.0)
                     time.sleep(0.5)  # Check state twice per second during calibration
                     continue
 
@@ -218,7 +239,7 @@ class ExerciseReader(QThread):
                     gui_update_counter = 0
                     loop_time = (time.perf_counter() - loop_start) * 1000
                     self.data_received.emit(motor_position, motor_velocity, current_iq, voltage,
-                                            loop_time, current_state, load_height)
+                                            loop_time, current_state, current_state_axis1, load_height)
 
                 # Check errors less frequently
                 error_check_counter += 1
@@ -257,6 +278,7 @@ class ExerciseGUI(QMainWindow):
         # ODrive connection
         self.odrv = None
         self.axis = None
+        self.axis1 = None
         self.reader_thread = None
 
         # Data buffers for plotting
@@ -280,6 +302,7 @@ class ExerciseGUI(QMainWindow):
         # Error tracking
         self.has_errors = False
         self.calibrating = False
+        self.calibrating_axis1 = False
         self.current_state = AXIS_STATE_IDLE
 
         self.init_ui()
@@ -426,24 +449,14 @@ class ExerciseGUI(QMainWindow):
         control_layout.setContentsMargins(15, 15, 15, 15)
         control_layout.setSpacing(15)
 
-        # Header row with enable, calibrate, stop
+        # Header row with title and stop button
         header_layout = QHBoxLayout()
 
         header_label = QLabel("Exercise Control")
         header_label.setObjectName("sectionHeader")
         header_layout.addWidget(header_label)
 
-        self.enable_checkbox = QCheckBox("Enable Motor")
-        self.enable_checkbox.setChecked(False)
-        self.enable_checkbox.stateChanged.connect(self.on_enable_changed)
-        self.enable_checkbox.setEnabled(False)
-        header_layout.addWidget(self.enable_checkbox)
-
-        self.calibrate_btn = QPushButton("Calibrate")
-        self.calibrate_btn.setStyleSheet("background-color: #2563eb; border: 1px solid #3b82f6;")
-        self.calibrate_btn.clicked.connect(self.run_calibration)
-        self.calibrate_btn.setEnabled(False)
-        header_layout.addWidget(self.calibrate_btn)
+        header_layout.addStretch()
 
         self.status_msg_label = QLabel("")
         self.status_msg_label.setStyleSheet("color: #f59e0b;")
@@ -457,6 +470,49 @@ class ExerciseGUI(QMainWindow):
         header_layout.addWidget(self.stop_btn)
 
         control_layout.addLayout(header_layout)
+
+        # Axis control row
+        axis_control_layout = QHBoxLayout()
+
+        # Axis 0 controls
+        axis0_label = QLabel("Axis 0:")
+        axis0_label.setStyleSheet("font-weight: bold; color: #14b8a6;")
+        axis_control_layout.addWidget(axis0_label)
+
+        self.enable_checkbox = QCheckBox("Enable")
+        self.enable_checkbox.setChecked(False)
+        self.enable_checkbox.stateChanged.connect(self.on_enable_changed)
+        self.enable_checkbox.setEnabled(False)
+        axis_control_layout.addWidget(self.enable_checkbox)
+
+        self.calibrate_btn = QPushButton("Calibrate")
+        self.calibrate_btn.setStyleSheet("background-color: #2563eb; border: 1px solid #3b82f6;")
+        self.calibrate_btn.clicked.connect(self.run_calibration)
+        self.calibrate_btn.setEnabled(False)
+        axis_control_layout.addWidget(self.calibrate_btn)
+
+        axis_control_layout.addSpacing(40)
+
+        # Axis 1 controls
+        axis1_label = QLabel("Axis 1:")
+        axis1_label.setStyleSheet("font-weight: bold; color: #f59e0b;")
+        axis_control_layout.addWidget(axis1_label)
+
+        self.enable_checkbox_axis1 = QCheckBox("Enable")
+        self.enable_checkbox_axis1.setChecked(False)
+        self.enable_checkbox_axis1.stateChanged.connect(self.on_enable_changed_axis1)
+        self.enable_checkbox_axis1.setEnabled(False)
+        axis_control_layout.addWidget(self.enable_checkbox_axis1)
+
+        self.calibrate_btn_axis1 = QPushButton("Calibrate")
+        self.calibrate_btn_axis1.setStyleSheet("background-color: #2563eb; border: 1px solid #3b82f6;")
+        self.calibrate_btn_axis1.clicked.connect(self.run_calibration_axis1)
+        self.calibrate_btn_axis1.setEnabled(False)
+        axis_control_layout.addWidget(self.calibrate_btn_axis1)
+
+        axis_control_layout.addStretch()
+
+        control_layout.addLayout(axis_control_layout)
 
         # Separator
         separator1 = QFrame()
@@ -656,9 +712,11 @@ class ExerciseGUI(QMainWindow):
         try:
             self.odrv = odrive.find_any(timeout=10)
             self.axis = self.odrv.axis0
+            self.axis1 = self.odrv.axis1
 
-            # Set to idle state initially
+            # Set both axes to idle state initially
             self.axis.requested_state = AXIS_STATE_IDLE
+            self.axis1.requested_state = AXIS_STATE_IDLE
 
             # Note: control_mode and input_mode are set when enabling the motor
             # to avoid interfering with calibration
@@ -669,12 +727,14 @@ class ExerciseGUI(QMainWindow):
             self.connect_btn.setText("Disconnect")
             self.enable_checkbox.setEnabled(True)
             self.calibrate_btn.setEnabled(True)
+            self.enable_checkbox_axis1.setEnabled(True)
+            self.calibrate_btn_axis1.setEnabled(True)
             self.set_height_btn.setEnabled(True)
             self.set_home_btn.setEnabled(True)
             self.clear_errors_btn.setEnabled(True)
 
             # Start reader thread with geometry
-            self.reader_thread = ExerciseReader(self.odrv, self.axis, self.geometry)
+            self.reader_thread = ExerciseReader(self.odrv, self.axis, self.axis1, self.geometry)
             self.reader_thread.load_force_lbs = self.load_force_lbs
             self.reader_thread.home_height = self.home_height
             self.reader_thread.data_received.connect(self.on_data_received)
@@ -702,6 +762,7 @@ class ExerciseGUI(QMainWindow):
         self.plot_timer.stop()
         self.odrv = None
         self.axis = None
+        self.axis1 = None
 
         self.status_label.setText("Disconnected")
         self.status_label.setStyleSheet("color: #ef4444; font-weight: bold;")
@@ -709,6 +770,9 @@ class ExerciseGUI(QMainWindow):
         self.enable_checkbox.setEnabled(False)
         self.enable_checkbox.setChecked(False)
         self.calibrate_btn.setEnabled(False)
+        self.enable_checkbox_axis1.setEnabled(False)
+        self.enable_checkbox_axis1.setChecked(False)
+        self.calibrate_btn_axis1.setEnabled(False)
         self.set_height_btn.setEnabled(False)
         self.set_home_btn.setEnabled(False)
         self.clear_errors_btn.setEnabled(False)
@@ -731,6 +795,15 @@ class ExerciseGUI(QMainWindow):
             self.reader_thread.request_state(AXIS_STATE_CLOSED_LOOP_CONTROL)
         else:
             self.reader_thread.request_state(AXIS_STATE_IDLE)
+
+    def on_enable_changed_axis1(self, state):
+        """Enable/disable axis1 - stub for now"""
+        # TODO: Implement axis1 enable/disable
+        if state == Qt.Checked:
+            self.status_msg_label.setText("Axis 1 enable not yet implemented")
+            self.status_msg_label.setStyleSheet("color: #f59e0b;")
+            self.enable_checkbox_axis1.setChecked(False)
+        pass
 
     def on_force_changed(self, value):
         """Update the load force in pounds"""
@@ -770,9 +843,11 @@ class ExerciseGUI(QMainWindow):
 
     def emergency_stop(self):
         self.enable_checkbox.setChecked(False)
+        self.enable_checkbox_axis1.setChecked(False)
 
         if self.reader_thread:
             self.reader_thread.request_state(AXIS_STATE_IDLE)
+        # TODO: Also stop axis1 when implemented
 
     def run_calibration(self):
         if self.reader_thread is None:
@@ -784,7 +859,21 @@ class ExerciseGUI(QMainWindow):
         self.calibrating = True
 
         self.reader_thread.request_state(AXIS_STATE_FULL_CALIBRATION_SEQUENCE)
-        self.status_msg_label.setText("Calibrating...")
+        self.status_msg_label.setText("Axis 0 calibrating...")
+        self.status_msg_label.setStyleSheet("color: #f59e0b;")
+
+    def run_calibration_axis1(self):
+        """Run calibration sequence for axis1"""
+        if self.reader_thread is None:
+            return
+
+        self.enable_checkbox_axis1.setChecked(False)
+        self.calibrate_btn_axis1.setEnabled(False)
+        self.calibrate_btn_axis1.setText("Calibrating...")
+        self.calibrating_axis1 = True
+
+        self.reader_thread.request_state_axis1(AXIS_STATE_FULL_CALIBRATION_SEQUENCE)
+        self.status_msg_label.setText("Axis 1 calibrating...")
         self.status_msg_label.setStyleSheet("color: #f59e0b;")
 
     def clear_errors(self):
@@ -796,7 +885,7 @@ class ExerciseGUI(QMainWindow):
         self.status_msg_label.setText("Errors cleared - recalibrate!")
         self.status_msg_label.setStyleSheet("color: #f59e0b;")
 
-    def on_data_received(self, motor_pos, motor_vel, current_iq, voltage, loop_time, current_state, load_height):
+    def on_data_received(self, motor_pos, motor_vel, current_iq, voltage, loop_time, current_state, current_state_axis1, load_height):
         # Store motor values
         self.motor_position = motor_pos
         self.motor_velocity = motor_vel
@@ -818,18 +907,28 @@ class ExerciseGUI(QMainWindow):
         mech_adv = self.geometry.get_mechanical_advantage(load_height)
         self.mech_adv_label.setText(f"MA: {mech_adv:.2f}")
 
-        # Check calibration status
+        # Check axis0 calibration status
         if self.calibrating and current_state == AXIS_STATE_IDLE:
             self.calibrating = False
             self.calibrate_btn.setText("Calibrate")
             self.calibrate_btn.setEnabled(True)
 
             if self.has_errors:
-                self.status_msg_label.setText("Calibration failed!")
+                self.status_msg_label.setText("Axis 0 calibration failed!")
                 self.status_msg_label.setStyleSheet("color: #ef4444;")
             else:
-                self.status_msg_label.setText("Calibration complete!")
+                self.status_msg_label.setText("Axis 0 calibration complete!")
                 self.status_msg_label.setStyleSheet("color: #14b8a6;")
+
+        # Check axis1 calibration status
+        if self.calibrating_axis1 and current_state_axis1 == AXIS_STATE_IDLE:
+            self.calibrating_axis1 = False
+            self.calibrate_btn_axis1.setText("Calibrate")
+            self.calibrate_btn_axis1.setEnabled(True)
+
+            # TODO: Check axis1-specific errors when error handling is extended
+            self.status_msg_label.setText("Axis 1 calibration complete!")
+            self.status_msg_label.setStyleSheet("color: #14b8a6;")
 
         # Store for plotting
         if self.start_time:
