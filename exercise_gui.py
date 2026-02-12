@@ -127,6 +127,9 @@ class ExerciseReader(QThread):
         self.requested_state = None
         self.requested_state_axis1 = None
         self.enabled = False
+        self.enabled_axis1 = False
+        self.pretension = False
+        self.pretension_force_lbs = 5.0
         self.clear_errors_requested = False
 
     def set_home_height(self, height_inches):
@@ -152,6 +155,10 @@ class ExerciseReader(QThread):
         """Thread-safe way to request a state change for axis1"""
         print(f"[DEBUG] Requesting axis1 state: {state}")
         self.requested_state_axis1 = state
+        if state == AXIS_STATE_CLOSED_LOOP_CONTROL:
+            self.enabled_axis1 = True
+        elif state == AXIS_STATE_IDLE:
+            self.enabled_axis1 = False
 
     def request_clear_errors(self):
         """Thread-safe way to request error clearing"""
@@ -184,13 +191,17 @@ class ExerciseReader(QThread):
 
                 # Handle clear errors
                 if self.clear_errors_requested:
-                    print("[DEBUG] Clearing errors")
+                    print("[DEBUG] Clearing errors on both axes")
                     self.axis.error = 0
                     self.axis.motor.error = 0
                     self.axis.encoder.error = 0
                     self.axis.controller.error = 0
+                    self.axis1.error = 0
+                    self.axis1.motor.error = 0
+                    self.axis1.encoder.error = 0
+                    self.axis1.controller.error = 0
                     self.clear_errors_requested = False
-                    print("[DEBUG] Errors cleared")
+                    print("[DEBUG] Errors cleared on both axes")
 
                 # Read current state for both axes
                 current_state = self.axis.current_state
@@ -216,22 +227,32 @@ class ExerciseReader(QThread):
                 # Convert motor position to load height using geometry
                 load_height = self.geometry.motor_turns_to_height(motor_position)
 
-                # Apply torque control when in closed loop
-                if current_state == AXIS_STATE_CLOSED_LOOP_CONTROL:
-                    # Apply force when below home height, zero when at or above
-                    if load_height < self.home_height:
-                        # Convert desired load force (lbs) to motor torque (Nm)
-                        torque_cmd = self.geometry.load_force_to_motor_torque(
-                            self.load_force_lbs, load_height)
-                    else:
-                        torque_cmd = 0.0
+                # Compute torque command based on mode
+                if self.pretension:
+                    # Pre-tension: constant force regardless of position
+                    torque_cmd = self.geometry.load_force_to_motor_torque(
+                        self.pretension_force_lbs, load_height)
+                elif load_height < self.home_height:
+                    # Normal: apply desired force when below home height
+                    torque_cmd = self.geometry.load_force_to_motor_torque(
+                        self.load_force_lbs, load_height)
+                else:
+                    torque_cmd = 0.0
 
+                # Apply torque to axis0 when in closed loop
+                if current_state == AXIS_STATE_CLOSED_LOOP_CONTROL:
                     self.axis.controller.input_torque = torque_cmd
 
-                    # Debug: print command periodically (every ~1 second)
-                    if gui_update_counter == 0:
-                        print(f"[DEBUG] height={load_height:.1f}in, home={self.home_height:.1f}in, "
-                              f"force={self.load_force_lbs:.1f}lbs, torque={torque_cmd:.3f}Nm")
+                # Apply torque to axis1 when in closed loop (opposite direction)
+                if current_state_axis1 == AXIS_STATE_CLOSED_LOOP_CONTROL:
+                    self.axis1.controller.input_torque = -torque_cmd
+
+                # Debug: print command periodically (every ~1 second)
+                if gui_update_counter == 0 and (current_state == AXIS_STATE_CLOSED_LOOP_CONTROL
+                                                 or current_state_axis1 == AXIS_STATE_CLOSED_LOOP_CONTROL):
+                    print(f"[DEBUG] height={load_height:.1f}in, home={self.home_height:.1f}in, "
+                          f"force={self.load_force_lbs:.1f}lbs, torque0={torque_cmd:.3f}Nm, "
+                          f"torque1={-torque_cmd:.3f}Nm")
 
                 # Throttle GUI updates to ~50Hz
                 gui_update_counter += 1
@@ -474,16 +495,34 @@ class ExerciseGUI(QMainWindow):
         # Axis control row
         axis_control_layout = QHBoxLayout()
 
-        # Axis 0 controls
-        axis0_label = QLabel("Axis 0:")
-        axis0_label.setStyleSheet("font-weight: bold; color: #14b8a6;")
-        axis_control_layout.addWidget(axis0_label)
-
-        self.enable_checkbox = QCheckBox("Enable")
+        self.enable_checkbox = QCheckBox("Enable Motors")
         self.enable_checkbox.setChecked(False)
         self.enable_checkbox.stateChanged.connect(self.on_enable_changed)
         self.enable_checkbox.setEnabled(False)
         axis_control_layout.addWidget(self.enable_checkbox)
+
+        self.pretension_checkbox = QCheckBox("Pre-tension")
+        self.pretension_checkbox.setChecked(False)
+        self.pretension_checkbox.stateChanged.connect(self.on_pretension_changed)
+        self.pretension_checkbox.setEnabled(False)
+        axis_control_layout.addWidget(self.pretension_checkbox)
+
+        self.pretension_input = QDoubleSpinBox()
+        self.pretension_input.setRange(0.5, 50.0)
+        self.pretension_input.setValue(5.0)
+        self.pretension_input.setSingleStep(0.5)
+        self.pretension_input.setDecimals(1)
+        self.pretension_input.setSuffix(" lbs")
+        self.pretension_input.setFixedWidth(100)
+        self.pretension_input.valueChanged.connect(self.on_pretension_force_changed)
+        axis_control_layout.addWidget(self.pretension_input)
+
+        axis_control_layout.addSpacing(40)
+
+        # Per-axis calibration buttons
+        axis0_label = QLabel("Axis 0:")
+        axis0_label.setStyleSheet("font-weight: bold; color: #14b8a6;")
+        axis_control_layout.addWidget(axis0_label)
 
         self.calibrate_btn = QPushButton("Calibrate")
         self.calibrate_btn.setStyleSheet("background-color: #2563eb; border: 1px solid #3b82f6;")
@@ -491,18 +530,11 @@ class ExerciseGUI(QMainWindow):
         self.calibrate_btn.setEnabled(False)
         axis_control_layout.addWidget(self.calibrate_btn)
 
-        axis_control_layout.addSpacing(40)
+        axis_control_layout.addSpacing(20)
 
-        # Axis 1 controls
         axis1_label = QLabel("Axis 1:")
         axis1_label.setStyleSheet("font-weight: bold; color: #f59e0b;")
         axis_control_layout.addWidget(axis1_label)
-
-        self.enable_checkbox_axis1 = QCheckBox("Enable")
-        self.enable_checkbox_axis1.setChecked(False)
-        self.enable_checkbox_axis1.stateChanged.connect(self.on_enable_changed_axis1)
-        self.enable_checkbox_axis1.setEnabled(False)
-        axis_control_layout.addWidget(self.enable_checkbox_axis1)
 
         self.calibrate_btn_axis1 = QPushButton("Calibrate")
         self.calibrate_btn_axis1.setStyleSheet("background-color: #2563eb; border: 1px solid #3b82f6;")
@@ -726,8 +758,8 @@ class ExerciseGUI(QMainWindow):
             self.status_label.setStyleSheet("color: #14b8a6; font-weight: bold;")
             self.connect_btn.setText("Disconnect")
             self.enable_checkbox.setEnabled(True)
+            self.pretension_checkbox.setEnabled(True)
             self.calibrate_btn.setEnabled(True)
-            self.enable_checkbox_axis1.setEnabled(True)
             self.calibrate_btn_axis1.setEnabled(True)
             self.set_height_btn.setEnabled(True)
             self.set_home_btn.setEnabled(True)
@@ -769,9 +801,9 @@ class ExerciseGUI(QMainWindow):
         self.connect_btn.setText("Connect")
         self.enable_checkbox.setEnabled(False)
         self.enable_checkbox.setChecked(False)
+        self.pretension_checkbox.setEnabled(False)
+        self.pretension_checkbox.setChecked(False)
         self.calibrate_btn.setEnabled(False)
-        self.enable_checkbox_axis1.setEnabled(False)
-        self.enable_checkbox_axis1.setChecked(False)
         self.calibrate_btn_axis1.setEnabled(False)
         self.set_height_btn.setEnabled(False)
         self.set_home_btn.setEnabled(False)
@@ -785,25 +817,35 @@ class ExerciseGUI(QMainWindow):
         self.status_label.setText("Connection Lost!")
 
     def on_enable_changed(self, state):
+        """Enable/disable both motors together"""
         if self.reader_thread is None:
             return
 
         if state == Qt.Checked:
-            # Configure for torque control before entering closed loop
+            # Configure both axes for torque control before entering closed loop
             self.axis.controller.config.control_mode = CONTROL_MODE_TORQUE_CONTROL
             self.axis.controller.config.input_mode = 1  # INPUT_MODE_PASSTHROUGH
+            self.axis1.controller.config.control_mode = CONTROL_MODE_TORQUE_CONTROL
+            self.axis1.controller.config.input_mode = 1  # INPUT_MODE_PASSTHROUGH
             self.reader_thread.request_state(AXIS_STATE_CLOSED_LOOP_CONTROL)
+            self.reader_thread.request_state_axis1(AXIS_STATE_CLOSED_LOOP_CONTROL)
         else:
             self.reader_thread.request_state(AXIS_STATE_IDLE)
+            self.reader_thread.request_state_axis1(AXIS_STATE_IDLE)
 
-    def on_enable_changed_axis1(self, state):
-        """Enable/disable axis1 - stub for now"""
-        # TODO: Implement axis1 enable/disable
-        if state == Qt.Checked:
-            self.status_msg_label.setText("Axis 1 enable not yet implemented")
-            self.status_msg_label.setStyleSheet("color: #f59e0b;")
-            self.enable_checkbox_axis1.setChecked(False)
-        pass
+    def on_pretension_changed(self, state):
+        """Toggle pre-tension mode (constant force regardless of position)"""
+        if self.reader_thread:
+            self.reader_thread.pretension = (state == Qt.Checked)
+            if state == Qt.Checked:
+                print(f"[DEBUG] Pre-tension ON ({self.pretension_input.value():.1f} lbs)")
+            else:
+                print("[DEBUG] Pre-tension OFF")
+
+    def on_pretension_force_changed(self, value):
+        """Update the pre-tension force"""
+        if self.reader_thread:
+            self.reader_thread.pretension_force_lbs = value
 
     def on_force_changed(self, value):
         """Update the load force in pounds"""
@@ -843,11 +885,10 @@ class ExerciseGUI(QMainWindow):
 
     def emergency_stop(self):
         self.enable_checkbox.setChecked(False)
-        self.enable_checkbox_axis1.setChecked(False)
 
         if self.reader_thread:
             self.reader_thread.request_state(AXIS_STATE_IDLE)
-        # TODO: Also stop axis1 when implemented
+            self.reader_thread.request_state_axis1(AXIS_STATE_IDLE)
 
     def run_calibration(self):
         if self.reader_thread is None:
@@ -867,7 +908,7 @@ class ExerciseGUI(QMainWindow):
         if self.reader_thread is None:
             return
 
-        self.enable_checkbox_axis1.setChecked(False)
+        self.enable_checkbox.setChecked(False)
         self.calibrate_btn_axis1.setEnabled(False)
         self.calibrate_btn_axis1.setText("Calibrating...")
         self.calibrating_axis1 = True
