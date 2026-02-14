@@ -6,9 +6,9 @@ cable system where two cables run from a single spool to pulleys, then meet at
 a load attachment point.
 
 Physical setup:
-    - Two pulleys spaced 48" apart (24" from center each)
+    - Two pulleys spaced 45" apart (22.5" from center each)
     - Load point moves vertically from 24" to 80" above the pulleys
-    - Both cables wind on a single 3" diameter spool
+    - Both cables wind on a single 2.75" diameter spool
     - 20:1 gearbox between motor and spool
     - Motor encoder tracks motor shaft rotation in turns
 
@@ -25,13 +25,15 @@ class CableGeometry:
     """Converts between motor units (turns, Nm) and load units (inches, lbs)."""
 
     # Physical constants
-    HALF_PULLEY_SPACING = 24.0  # inches (half of 48" total spacing)
-    SPOOL_DIAMETER = 3.0  # inches
-    SPOOL_RADIUS_INCHES = SPOOL_DIAMETER / 2  # 1.5 inches
-    SPOOL_RADIUS_METERS = SPOOL_RADIUS_INCHES * 0.0254  # ~0.0381 m
-    SPOOL_CIRCUMFERENCE = math.pi * SPOOL_DIAMETER  # ~9.425 inches
+    HALF_PULLEY_SPACING = 22.5  # inches (half of 45" total spacing)
+    SPOOL_DIAMETER = 2.75  # inches
+    SPOOL_RADIUS_INCHES = SPOOL_DIAMETER / 2  # 1.375 inches
+    SPOOL_RADIUS_METERS = SPOOL_RADIUS_INCHES * 0.0254  # ~0.0349 m
+    SPOOL_CIRCUMFERENCE = math.pi * SPOOL_DIAMETER  # ~8.639 inches
     GEAR_RATIO = 20.0  # 20:1 gearbox, motor turns 20x per spool turn
-    CABLE_PER_MOTOR_TURN = SPOOL_CIRCUMFERENCE / GEAR_RATIO  # ~0.471 inches
+    # Both cables wind on the same spool, so one spool turn pays out
+    # circumference worth of cable on EACH side (2x total cable change)
+    CABLE_PER_MOTOR_TURN = 2.0 * SPOOL_CIRCUMFERENCE / GEAR_RATIO  # ~0.864 inches total
 
     # Unit conversion constants
     NEWTONS_PER_LBF = 4.44822  # 1 pound-force = 4.448 N
@@ -229,8 +231,9 @@ class CableGeometry:
         """
         # Motor torque -> cable tension (through gearbox)
         # T_spool = T_motor * gear_ratio
-        # T_cable = T_spool / spool_radius
-        cable_tension_n = motor_torque_nm * self.GEAR_RATIO / self.SPOOL_RADIUS_METERS
+        # Two cables pull on spool: T_spool = 2 * T_cable * spool_radius
+        # T_cable = T_spool / (2 * spool_radius)
+        cable_tension_n = motor_torque_nm * self.GEAR_RATIO / (2.0 * self.SPOOL_RADIUS_METERS)
 
         # Cable tension -> vertical force
         # F_vertical = 2 * T_cable * sin(theta)
@@ -268,9 +271,9 @@ class CableGeometry:
         cable_tension_n = force_n / (2.0 * sin_theta)
 
         # Cable tension -> motor torque (through gearbox)
-        # T_spool = T_cable * spool_radius
+        # Two cables pull on spool: T_spool = 2 * T_cable * spool_radius
         # T_motor = T_spool / gear_ratio
-        motor_torque_nm = cable_tension_n * self.SPOOL_RADIUS_METERS / self.GEAR_RATIO
+        motor_torque_nm = cable_tension_n * 2.0 * self.SPOOL_RADIUS_METERS / self.GEAR_RATIO
 
         return motor_torque_nm
 

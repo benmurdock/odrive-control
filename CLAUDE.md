@@ -50,15 +50,15 @@ The system uses a V-pulley configuration:
           /  \
          / h  \     h = 24" to 80" above pulleys
         /      \
-   [P1]──48"──[P2]  Pulleys 24" from center each
+   [P1]──45"──[P2]  Pulleys 22.5" from center each
        ↓       ↓
-      (both cables to single 3" spool, 20:1 gearbox)
+      (both cables to single 2.75" spool, 20:1 gearbox)
 ```
 
 Key relationships (in `cable_geometry.py`):
-- `sin(θ) = h / sqrt(576 + h²)` - cable angle factor
+- `sin(θ) = h / sqrt(506.25 + h²)` - cable angle factor
 - Force: `motor_torque = load_force * spool_radius / (2 * sin(θ))`
-- Position: `cable_length = 2 * sqrt(576 + h²)`
+- Position: `cable_length = 2 * sqrt(506.25 + h²)`
 
 At lower heights, cables are at steeper angles → need more motor torque per lb.
 At higher heights, cables are more vertical → need less motor torque per lb.
