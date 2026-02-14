@@ -52,7 +52,7 @@ The system uses a V-pulley configuration:
         /      \
    [P1]──48"──[P2]  Pulleys 24" from center each
        ↓       ↓
-      (both cables to single 1.5" spool)
+      (both cables to single 3" spool, 20:1 gearbox)
 ```
 
 Key relationships (in `cable_geometry.py`):

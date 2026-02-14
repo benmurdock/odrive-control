@@ -8,8 +8,9 @@ a load attachment point.
 Physical setup:
     - Two pulleys spaced 48" apart (24" from center each)
     - Load point moves vertically from 24" to 80" above the pulleys
-    - Both cables wind on a single 1.5" diameter spool
-    - Motor encoder tracks spool rotation in turns
+    - Both cables wind on a single 3" diameter spool
+    - 20:1 gearbox between motor and spool
+    - Motor encoder tracks motor shaft rotation in turns
 
 Coordinate conventions:
     - Height (h): vertical distance from pulley level to load point, in inches
@@ -25,10 +26,12 @@ class CableGeometry:
 
     # Physical constants
     HALF_PULLEY_SPACING = 24.0  # inches (half of 48" total spacing)
-    SPOOL_DIAMETER = 1.5  # inches
-    SPOOL_RADIUS_INCHES = SPOOL_DIAMETER / 2  # 0.75 inches
-    SPOOL_RADIUS_METERS = SPOOL_RADIUS_INCHES * 0.0254  # ~0.01905 m
-    SPOOL_CIRCUMFERENCE = math.pi * SPOOL_DIAMETER  # ~4.712 inches
+    SPOOL_DIAMETER = 3.0  # inches
+    SPOOL_RADIUS_INCHES = SPOOL_DIAMETER / 2  # 1.5 inches
+    SPOOL_RADIUS_METERS = SPOOL_RADIUS_INCHES * 0.0254  # ~0.0381 m
+    SPOOL_CIRCUMFERENCE = math.pi * SPOOL_DIAMETER  # ~9.425 inches
+    GEAR_RATIO = 20.0  # 20:1 gearbox, motor turns 20x per spool turn
+    CABLE_PER_MOTOR_TURN = SPOOL_CIRCUMFERENCE / GEAR_RATIO  # ~0.471 inches
 
     # Unit conversion constants
     NEWTONS_PER_LBF = 4.44822  # 1 pound-force = 4.448 N
@@ -137,7 +140,7 @@ class CableGeometry:
         # Calculate how much cable has changed since reference
         # Positive motor turns (in our convention) = more cable paid out = higher load
         turns_delta = (motor_turns - self.reference_motor_turns) * self.motor_direction
-        cable_delta = turns_delta * self.SPOOL_CIRCUMFERENCE
+        cable_delta = turns_delta * self.CABLE_PER_MOTOR_TURN
 
         # Current cable length
         current_cable = ref_cable + cable_delta
@@ -161,7 +164,7 @@ class CableGeometry:
         target_cable = self._cable_length_at_height(height_inches)
 
         cable_delta = target_cable - ref_cable
-        turns_delta = cable_delta / self.SPOOL_CIRCUMFERENCE
+        turns_delta = cable_delta / self.CABLE_PER_MOTOR_TURN
 
         return self.reference_motor_turns + (turns_delta * self.motor_direction)
 
@@ -177,7 +180,7 @@ class CableGeometry:
             Load velocity in inches/sec (positive = rising)
         """
         # Motor velocity -> cable velocity
-        cable_vel = motor_vel_turns_per_sec * self.motor_direction * self.SPOOL_CIRCUMFERENCE
+        cable_vel = motor_vel_turns_per_sec * self.motor_direction * self.CABLE_PER_MOTOR_TURN
 
         # Cable velocity -> load velocity
         # d(cable)/dt = 2 * sin(theta) * d(height)/dt
@@ -209,7 +212,7 @@ class CableGeometry:
         cable_vel = load_vel_inches_per_sec * 2.0 * sin_theta
 
         # Cable velocity -> motor velocity
-        motor_vel = cable_vel / self.SPOOL_CIRCUMFERENCE * self.motor_direction
+        motor_vel = cable_vel / self.CABLE_PER_MOTOR_TURN * self.motor_direction
 
         return motor_vel
 
@@ -224,9 +227,10 @@ class CableGeometry:
         Returns:
             Vertical force at load in pounds (positive = upward)
         """
-        # Motor torque -> cable tension
-        # T_cable = T_motor / spool_radius
-        cable_tension_n = motor_torque_nm / self.SPOOL_RADIUS_METERS
+        # Motor torque -> cable tension (through gearbox)
+        # T_spool = T_motor * gear_ratio
+        # T_cable = T_spool / spool_radius
+        cable_tension_n = motor_torque_nm * self.GEAR_RATIO / self.SPOOL_RADIUS_METERS
 
         # Cable tension -> vertical force
         # F_vertical = 2 * T_cable * sin(theta)
@@ -263,9 +267,10 @@ class CableGeometry:
 
         cable_tension_n = force_n / (2.0 * sin_theta)
 
-        # Cable tension -> motor torque
-        # T_motor = T_cable * spool_radius
-        motor_torque_nm = cable_tension_n * self.SPOOL_RADIUS_METERS
+        # Cable tension -> motor torque (through gearbox)
+        # T_spool = T_cable * spool_radius
+        # T_motor = T_spool / gear_ratio
+        motor_torque_nm = cable_tension_n * self.SPOOL_RADIUS_METERS / self.GEAR_RATIO
 
         return motor_torque_nm
 

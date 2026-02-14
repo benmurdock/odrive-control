@@ -29,7 +29,10 @@ python exercise_gui.py
 """
 
 import sys
+import os
+import csv
 import time
+from datetime import datetime
 from collections import deque
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QLineEdit,
@@ -132,6 +135,13 @@ class ExerciseReader(QThread):
         self.pretension_force_lbs = 5.0
         self.clear_errors_requested = False
 
+        # Logging
+        self.logging_active = False
+        self.log_file = None
+        self.log_writer = None
+        self.log_start_time = None
+        self.log_duration = 10.0  # seconds
+
     def set_home_height(self, height_inches):
         """Thread-safe way to update home height in inches"""
         self.home_height = height_inches
@@ -159,6 +169,29 @@ class ExerciseReader(QThread):
             self.enabled_axis1 = True
         elif state == AXIS_STATE_IDLE:
             self.enabled_axis1 = False
+
+    def start_logging(self, filepath):
+        """Start CSV logging to the given filepath"""
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        self.log_file = open(filepath, 'w', newline='')
+        self.log_writer = csv.writer(self.log_file)
+        self.log_writer.writerow([
+            'timestamp_s', 'torque_cmd_ax0', 'torque_cmd_ax1',
+            'amps_ax0', 'amps_ax1', 'pos_turns_ax0', 'pos_turns_ax1',
+            'height_inches', 'pretension_lbs', 'weight_lbs', 'pretension_active',
+        ])
+        self.log_start_time = time.perf_counter()
+        self.logging_active = True
+        print(f"[LOG] Started logging to {filepath}")
+
+    def stop_logging(self):
+        """Stop CSV logging and close the file"""
+        self.logging_active = False
+        if self.log_file:
+            self.log_file.close()
+            self.log_file = None
+            self.log_writer = None
+        print("[LOG] Logging stopped")
 
     def request_clear_errors(self):
         """Thread-safe way to request error clearing"""
@@ -218,10 +251,12 @@ class ExerciseReader(QThread):
                     time.sleep(0.5)  # Check state twice per second during calibration
                     continue
 
-                # Normal operation - read all values
+                # Normal operation - read all values from both axes
                 motor_position = self.axis.encoder.pos_estimate
                 motor_velocity = self.axis.encoder.vel_estimate
                 current_iq = self.axis.motor.current_control.Iq_measured
+                motor_position_ax1 = self.axis1.encoder.pos_estimate
+                current_iq_ax1 = self.axis1.motor.current_control.Iq_measured
                 voltage = self.odrv.vbus_voltage
 
                 # Convert motor position to load height using geometry
@@ -246,6 +281,26 @@ class ExerciseReader(QThread):
                 # Apply torque to axis1 when in closed loop (opposite direction)
                 if current_state_axis1 == AXIS_STATE_CLOSED_LOOP_CONTROL:
                     self.axis1.controller.input_torque = -torque_cmd
+
+                # CSV logging at full loop rate
+                if self.logging_active and self.log_writer:
+                    elapsed = time.perf_counter() - self.log_start_time
+                    if elapsed >= self.log_duration:
+                        self.stop_logging()
+                    else:
+                        self.log_writer.writerow([
+                            f'{elapsed:.4f}',
+                            f'{torque_cmd:.4f}',
+                            f'{-torque_cmd:.4f}',
+                            f'{current_iq:.4f}',
+                            f'{current_iq_ax1:.4f}',
+                            f'{motor_position:.4f}',
+                            f'{motor_position_ax1:.4f}',
+                            f'{load_height:.2f}',
+                            f'{self.pretension_force_lbs:.1f}',
+                            f'{self.load_force_lbs:.1f}',
+                            f'{int(self.pretension)}',
+                        ])
 
                 # Debug: print command periodically (every ~1 second)
                 if gui_update_counter == 0 and (current_state == AXIS_STATE_CLOSED_LOOP_CONTROL
@@ -294,7 +349,7 @@ class ExerciseGUI(QMainWindow):
         self.setGeometry(100, 100, 1000, 800)
 
         # Cable geometry for unit conversions
-        self.geometry = CableGeometry(motor_direction=1)
+        self.geometry = CableGeometry(motor_direction=-1)
 
         # ODrive connection
         self.odrv = None
@@ -485,6 +540,12 @@ class ExerciseGUI(QMainWindow):
 
         header_layout.addStretch()
 
+        self.log_btn = QPushButton("Start Logging")
+        self.log_btn.setStyleSheet("background-color: #7c3aed; border: 1px solid #8b5cf6;")
+        self.log_btn.clicked.connect(self.start_logging)
+        self.log_btn.setEnabled(False)
+        header_layout.addWidget(self.log_btn)
+
         self.stop_btn = QPushButton("STOP")
         self.stop_btn.setObjectName("stopButton")
         self.stop_btn.clicked.connect(self.emergency_stop)
@@ -562,7 +623,7 @@ class ExerciseGUI(QMainWindow):
         self.height_input = QLineEdit()
         self.height_input.setPlaceholderText("inches")
         self.height_input.setFixedWidth(80)
-        self.height_input.setValidator(QDoubleValidator(24.0, 80.0, 1))
+        self.height_input.setValidator(QDoubleValidator(0.0, 99.0, 1))
         height_cal_layout.addWidget(self.height_input)
 
         self.set_height_btn = QPushButton("Set")
@@ -761,6 +822,7 @@ class ExerciseGUI(QMainWindow):
             self.pretension_checkbox.setEnabled(True)
             self.calibrate_btn.setEnabled(True)
             self.calibrate_btn_axis1.setEnabled(True)
+            self.log_btn.setEnabled(True)
             self.set_height_btn.setEnabled(True)
             self.set_home_btn.setEnabled(True)
             self.clear_errors_btn.setEnabled(True)
@@ -787,6 +849,7 @@ class ExerciseGUI(QMainWindow):
         self.enable_checkbox.setChecked(False)
 
         if self.reader_thread:
+            self.reader_thread.stop_logging()
             self.reader_thread.stop()
             self.reader_thread.wait()
             self.reader_thread = None
@@ -805,6 +868,8 @@ class ExerciseGUI(QMainWindow):
         self.pretension_checkbox.setChecked(False)
         self.calibrate_btn.setEnabled(False)
         self.calibrate_btn_axis1.setEnabled(False)
+        self.log_btn.setEnabled(False)
+        self.log_btn.setText("Start Logging")
         self.set_height_btn.setEnabled(False)
         self.set_home_btn.setEnabled(False)
         self.clear_errors_btn.setEnabled(False)
@@ -847,6 +912,31 @@ class ExerciseGUI(QMainWindow):
         if self.reader_thread:
             self.reader_thread.pretension_force_lbs = value
 
+    def start_logging(self):
+        """Start a 10-second CSV log"""
+        if self.reader_thread is None:
+            return
+
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filepath = os.path.join(log_dir, f'{timestamp}.csv')
+
+        self.reader_thread.start_logging(filepath)
+        self.log_btn.setEnabled(False)
+        self.log_btn.setText("Logging...")
+        self.status_msg_label.setText(f"Logging for 10s...")
+        self.status_msg_label.setStyleSheet("color: #7c3aed;")
+
+        # Timer to re-enable button after logging completes
+        QTimer.singleShot(10500, self.on_logging_complete)
+
+    def on_logging_complete(self):
+        """Re-enable the logging button after duration elapses"""
+        self.log_btn.setEnabled(True)
+        self.log_btn.setText("Start Logging")
+        self.status_msg_label.setText("Logging complete!")
+        self.status_msg_label.setStyleSheet("color: #14b8a6;")
+
     def on_force_changed(self, value):
         """Update the load force in pounds"""
         self.load_force_lbs = value
@@ -857,7 +947,7 @@ class ExerciseGUI(QMainWindow):
         """Set the current height calibration from user input"""
         try:
             height = float(self.height_input.text())
-            if 24.0 <= height <= 80.0:
+            if 0.0 <= height <= 99.0:
                 # Update geometry reference with current motor position
                 self.geometry.set_reference(height, self.motor_position)
                 self.load_height = height
