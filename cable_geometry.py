@@ -7,7 +7,7 @@ a load attachment point.
 
 Physical setup:
     - Two pulleys spaced 45" apart (22.5" from center each)
-    - Load point moves vertically from 24" to 80" above the pulleys
+    - Load point moves vertically from 0" to 80" above the pulleys
     - Both cables wind on a single 2.75" diameter spool
     - 20:1 gearbox between motor and spool
     - Motor encoder tracks motor shaft rotation in turns
@@ -102,13 +102,7 @@ class CableGeometry:
         # h^2 = (cable_length/2)^2 - 576
         half_cable = cable_length / 2.0
         h_squared = half_cable ** 2 - self.HALF_PULLEY_SPACING ** 2
-
-        if h_squared < 0:
-            # Cable is too short - would be below pulley level
-            # Clamp to minimum
-            return self.MIN_HEIGHT
-
-        return math.sqrt(h_squared)
+        return math.sqrt(max(h_squared, 0.0))
 
     def _sin_theta(self, h):
         """

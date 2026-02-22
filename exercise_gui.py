@@ -3,19 +3,18 @@
 Exercise Machine GUI - V-Pulley Cable System
 
 Controls an ODrive motor connected to a cable system with the following geometry:
-- Two pulleys spaced 48" apart horizontally
-- Both cables wind on a single 1.5" diameter spool
-- Load attachment point moves vertically from 24" to 80" above pulleys
+- Two pulleys spaced 45" apart horizontally
+- Both cables wind on a single 2.75" diameter spool
+- 20:1 gearbox between motor and spool
 
 The GUI operates in load-side units:
 - Force in pounds (lbs)
 - Height in inches
 - Motor stats shown for debugging
 
-Control paradigm:
-- Torque control mode with force conversion based on cable geometry
-- When load is below "home height", motor applies constant vertical force
-- When load is at or above home height, motor applies zero force (freewheel)
+Control modes:
+- Pre-tension (Ready): low constant force with velocity boost for spool-in
+- Active: full simulated weight force via torque control
 
 Calibration:
 - Enter the current load height and click "Set" to sync with encoder
@@ -121,11 +120,8 @@ class ExerciseReader(QThread):
         self.geometry = geometry
         self.running = True
 
-        # Home height - the "floor" where the weight rests (in inches)
-        self.home_height = 24.0  # inches (at pulley level minimum)
-
         # Load force to apply (simulated weight) in pounds
-        self.load_force_lbs = 5.0  # lbs - force applied when below home height
+        self.load_force_lbs = 5.0  # lbs - simulated weight force
 
         self.requested_state = None
         self.requested_state_axis1 = None
@@ -133,6 +129,8 @@ class ExerciseReader(QThread):
         self.enabled_axis1 = False
         self.pretension = False
         self.pretension_force_lbs = 5.0
+        self.pretension_boost_gain = 0.05  # Nm per (turn/sec) — gearbox drag compensation
+        self.pretension_boost_max = 0.5    # Nm — ceiling on boost torque
         self.clear_errors_requested = False
 
         # Logging
@@ -141,10 +139,6 @@ class ExerciseReader(QThread):
         self.log_writer = None
         self.log_start_time = None
         self.log_duration = 10.0  # seconds
-
-    def set_home_height(self, height_inches):
-        """Thread-safe way to update home height in inches"""
-        self.home_height = height_inches
 
     def set_load_force(self, force_lbs):
         """Thread-safe way to update load force in pounds"""
@@ -179,6 +173,7 @@ class ExerciseReader(QThread):
             'timestamp_s', 'torque_cmd_ax0', 'torque_cmd_ax1',
             'amps_ax0', 'amps_ax1', 'pos_turns_ax0', 'pos_turns_ax1',
             'height_inches', 'pretension_lbs', 'weight_lbs', 'pretension_active',
+            'boost_torque',
         ])
         self.log_start_time = time.perf_counter()
         self.logging_active = True
@@ -263,16 +258,19 @@ class ExerciseReader(QThread):
                 load_height = self.geometry.motor_turns_to_height(motor_position)
 
                 # Compute torque command based on mode
+                boost = 0.0
                 if self.pretension:
-                    # Pre-tension: constant force regardless of position
-                    torque_cmd = self.geometry.load_force_to_motor_torque(
+                    # Pre-tension: base force + velocity boost for gearbox drag
+                    base_torque = self.geometry.load_force_to_motor_torque(
                         self.pretension_force_lbs, load_height)
-                elif load_height < self.home_height:
-                    # Normal: apply desired force when below home height
+                    spool_in_speed = -motor_velocity * self.geometry.motor_direction
+                    if spool_in_speed > 0:
+                        boost = min(spool_in_speed * self.pretension_boost_gain,
+                                    self.pretension_boost_max)
+                    torque_cmd = base_torque + boost
+                else:
                     torque_cmd = self.geometry.load_force_to_motor_torque(
                         self.load_force_lbs, load_height)
-                else:
-                    torque_cmd = 0.0
 
                 # Apply torque to axis0 when in closed loop
                 if current_state == AXIS_STATE_CLOSED_LOOP_CONTROL:
@@ -300,14 +298,15 @@ class ExerciseReader(QThread):
                             f'{self.pretension_force_lbs:.1f}',
                             f'{self.load_force_lbs:.1f}',
                             f'{int(self.pretension)}',
+                            f'{boost:.4f}',
                         ])
 
                 # Debug: print command periodically (every ~1 second)
                 if gui_update_counter == 0 and (current_state == AXIS_STATE_CLOSED_LOOP_CONTROL
                                                  or current_state_axis1 == AXIS_STATE_CLOSED_LOOP_CONTROL):
-                    print(f"[DEBUG] height={load_height:.1f}in, home={self.home_height:.1f}in, "
+                    print(f"[DEBUG] height={load_height:.1f}in, "
                           f"force={self.load_force_lbs:.1f}lbs, torque0={torque_cmd:.3f}Nm, "
-                          f"torque1={-torque_cmd:.3f}Nm")
+                          f"torque1={-torque_cmd:.3f}Nm, boost={boost:.3f}Nm")
 
                 # Throttle GUI updates to ~50Hz
                 gui_update_counter += 1
@@ -372,7 +371,6 @@ class ExerciseGUI(QMainWindow):
 
         # Load state (converted via geometry)
         self.load_height = 24.0  # inches
-        self.home_height = 24.0  # inches - where the "weight" wants to return to
         self.load_force_lbs = 5.0  # lbs - simulated weight force
 
         # Error tracking
@@ -556,12 +554,6 @@ class ExerciseGUI(QMainWindow):
         # Axis control row
         axis_control_layout = QHBoxLayout()
 
-        self.enable_checkbox = QCheckBox("Enable Motors")
-        self.enable_checkbox.setChecked(False)
-        self.enable_checkbox.stateChanged.connect(self.on_enable_changed)
-        self.enable_checkbox.setEnabled(False)
-        axis_control_layout.addWidget(self.enable_checkbox)
-
         self.pretension_checkbox = QCheckBox("Pre-tension")
         self.pretension_checkbox.setChecked(False)
         self.pretension_checkbox.stateChanged.connect(self.on_pretension_changed)
@@ -577,6 +569,33 @@ class ExerciseGUI(QMainWindow):
         self.pretension_input.setFixedWidth(100)
         self.pretension_input.valueChanged.connect(self.on_pretension_force_changed)
         axis_control_layout.addWidget(self.pretension_input)
+
+        boost_gain_label = QLabel("Boost:")
+        boost_gain_label.setStyleSheet("color: #a0a0a0; font-size: 10pt;")
+        axis_control_layout.addWidget(boost_gain_label)
+
+        self.boost_gain_input = QDoubleSpinBox()
+        self.boost_gain_input.setRange(0.0, 1.0)
+        self.boost_gain_input.setValue(0.05)
+        self.boost_gain_input.setSingleStep(0.01)
+        self.boost_gain_input.setDecimals(2)
+        self.boost_gain_input.setFixedWidth(80)
+        self.boost_gain_input.valueChanged.connect(self.on_boost_gain_changed)
+        axis_control_layout.addWidget(self.boost_gain_input)
+
+        boost_max_label = QLabel("Max:")
+        boost_max_label.setStyleSheet("color: #a0a0a0; font-size: 10pt;")
+        axis_control_layout.addWidget(boost_max_label)
+
+        self.boost_max_input = QDoubleSpinBox()
+        self.boost_max_input.setRange(0.0, 2.0)
+        self.boost_max_input.setValue(0.5)
+        self.boost_max_input.setSingleStep(0.1)
+        self.boost_max_input.setDecimals(1)
+        self.boost_max_input.setSuffix(" Nm")
+        self.boost_max_input.setFixedWidth(90)
+        self.boost_max_input.valueChanged.connect(self.on_boost_max_changed)
+        axis_control_layout.addWidget(self.boost_max_input)
 
         axis_control_layout.addSpacing(40)
 
@@ -613,31 +632,18 @@ class ExerciseGUI(QMainWindow):
         separator1.setStyleSheet("background-color: #3d3d3d;")
         control_layout.addWidget(separator1)
 
-        # Height calibration row
-        height_cal_layout = QHBoxLayout()
+        # Active mode + Load force row
+        active_force_layout = QHBoxLayout()
 
-        height_cal_label = QLabel("Current Height:")
-        height_cal_label.setStyleSheet("font-size: 12pt;")
-        height_cal_layout.addWidget(height_cal_label)
+        self.active_checkbox = QCheckBox("Active")
+        self.active_checkbox.setChecked(False)
+        self.active_checkbox.stateChanged.connect(self.on_active_changed)
+        self.active_checkbox.setEnabled(False)
+        active_force_layout.addWidget(self.active_checkbox)
 
-        self.height_input = QLineEdit()
-        self.height_input.setPlaceholderText("inches")
-        self.height_input.setFixedWidth(80)
-        self.height_input.setValidator(QDoubleValidator(0.0, 99.0, 1))
-        height_cal_layout.addWidget(self.height_input)
-
-        self.set_height_btn = QPushButton("Set")
-        self.set_height_btn.setStyleSheet("background-color: #2563eb; border: 1px solid #3b82f6;")
-        self.set_height_btn.clicked.connect(self.on_set_height)
-        self.set_height_btn.setEnabled(False)
-        height_cal_layout.addWidget(self.set_height_btn)
-
-        height_cal_layout.addSpacing(30)
-
-        # Load force setting
         force_label = QLabel("Load Force:")
         force_label.setStyleSheet("font-size: 12pt;")
-        height_cal_layout.addWidget(force_label)
+        active_force_layout.addWidget(force_label)
 
         self.force_input = QDoubleSpinBox()
         self.force_input.setRange(0.5, 100.0)
@@ -647,18 +653,11 @@ class ExerciseGUI(QMainWindow):
         self.force_input.setSuffix(" lbs")
         self.force_input.setFixedWidth(100)
         self.force_input.valueChanged.connect(self.on_force_changed)
-        height_cal_layout.addWidget(self.force_input)
+        active_force_layout.addWidget(self.force_input)
 
-        height_cal_layout.addStretch()
+        active_force_layout.addStretch()
 
-        # Home height button
-        self.set_home_btn = QPushButton("Set Home Height")
-        self.set_home_btn.setObjectName("zeroButton")
-        self.set_home_btn.clicked.connect(self.set_home_position)
-        self.set_home_btn.setEnabled(False)
-        height_cal_layout.addWidget(self.set_home_btn)
-
-        control_layout.addLayout(height_cal_layout)
+        control_layout.addLayout(active_force_layout)
 
         # Separator
         separator2 = QFrame()
@@ -689,6 +688,29 @@ class ExerciseGUI(QMainWindow):
 
         measured_layout.addLayout(height_container)
 
+        # Height calibration input (to the right of Load Height readout)
+        height_cal_container = QVBoxLayout()
+        height_cal_label = QLabel("Calibrate")
+        height_cal_label.setStyleSheet("color: #a0a0a0;")
+        height_cal_label.setAlignment(Qt.AlignCenter)
+        height_cal_container.addWidget(height_cal_label)
+
+        height_cal_row = QHBoxLayout()
+        self.height_input = QLineEdit()
+        self.height_input.setPlaceholderText("inches")
+        self.height_input.setFixedWidth(70)
+        self.height_input.setValidator(QDoubleValidator(0.0, 99.0, 1))
+        height_cal_row.addWidget(self.height_input)
+
+        self.set_height_btn = QPushButton("Set")
+        self.set_height_btn.setStyleSheet("background-color: #2563eb; border: 1px solid #3b82f6; padding: 4px 8px;")
+        self.set_height_btn.clicked.connect(self.on_set_height)
+        self.set_height_btn.setEnabled(False)
+        height_cal_row.addWidget(self.set_height_btn)
+
+        height_cal_container.addLayout(height_cal_row)
+        measured_layout.addLayout(height_cal_container)
+
         measured_layout.addStretch()
 
         # Current display (motor side, but useful feedback)
@@ -710,28 +732,6 @@ class ExerciseGUI(QMainWindow):
         current_container.addWidget(current_unit)
 
         measured_layout.addLayout(current_container)
-
-        measured_layout.addStretch()
-
-        # Home height display
-        home_container = QVBoxLayout()
-        home_label = QLabel("Home Height")
-        home_label.setStyleSheet("color: #a0a0a0;")
-        home_label.setAlignment(Qt.AlignCenter)
-        home_container.addWidget(home_label)
-
-        self.home_display = QLabel("24.0")
-        self.home_display.setObjectName("valueDisplay")
-        self.home_display.setStyleSheet("color: #8b5cf6; font-size: 24pt;")
-        self.home_display.setAlignment(Qt.AlignCenter)
-        home_container.addWidget(self.home_display)
-
-        home_unit = QLabel("inches")
-        home_unit.setStyleSheet("color: #a0a0a0;")
-        home_unit.setAlignment(Qt.AlignCenter)
-        home_container.addWidget(home_unit)
-
-        measured_layout.addLayout(home_container)
 
         control_layout.addLayout(measured_layout)
 
@@ -818,19 +818,17 @@ class ExerciseGUI(QMainWindow):
             self.status_label.setText(f"Connected: {serial}")
             self.status_label.setStyleSheet("color: #14b8a6; font-weight: bold;")
             self.connect_btn.setText("Disconnect")
-            self.enable_checkbox.setEnabled(True)
             self.pretension_checkbox.setEnabled(True)
+            self.active_checkbox.setEnabled(True)
             self.calibrate_btn.setEnabled(True)
             self.calibrate_btn_axis1.setEnabled(True)
             self.log_btn.setEnabled(True)
             self.set_height_btn.setEnabled(True)
-            self.set_home_btn.setEnabled(True)
             self.clear_errors_btn.setEnabled(True)
 
             # Start reader thread with geometry
             self.reader_thread = ExerciseReader(self.odrv, self.axis, self.axis1, self.geometry)
             self.reader_thread.load_force_lbs = self.load_force_lbs
-            self.reader_thread.home_height = self.home_height
             self.reader_thread.data_received.connect(self.on_data_received)
             self.reader_thread.errors_received.connect(self.on_errors_received)
             self.reader_thread.connection_lost.connect(self.on_connection_lost)
@@ -846,7 +844,8 @@ class ExerciseGUI(QMainWindow):
             self.odrv = None
 
     def disconnect_odrive(self):
-        self.enable_checkbox.setChecked(False)
+        self.pretension_checkbox.setChecked(False)
+        self.active_checkbox.setChecked(False)
 
         if self.reader_thread:
             self.reader_thread.stop_logging()
@@ -862,16 +861,15 @@ class ExerciseGUI(QMainWindow):
         self.status_label.setText("Disconnected")
         self.status_label.setStyleSheet("color: #ef4444; font-weight: bold;")
         self.connect_btn.setText("Connect")
-        self.enable_checkbox.setEnabled(False)
-        self.enable_checkbox.setChecked(False)
         self.pretension_checkbox.setEnabled(False)
         self.pretension_checkbox.setChecked(False)
+        self.active_checkbox.setEnabled(False)
+        self.active_checkbox.setChecked(False)
         self.calibrate_btn.setEnabled(False)
         self.calibrate_btn_axis1.setEnabled(False)
         self.log_btn.setEnabled(False)
         self.log_btn.setText("Start Logging")
         self.set_height_btn.setEnabled(False)
-        self.set_home_btn.setEnabled(False)
         self.clear_errors_btn.setEnabled(False)
         self.clear_errors_btn.setVisible(False)
         self.status_msg_label.setText("")
@@ -881,36 +879,69 @@ class ExerciseGUI(QMainWindow):
         self.disconnect_odrive()
         self.status_label.setText("Connection Lost!")
 
-    def on_enable_changed(self, state):
-        """Enable/disable both motors together"""
+    def _enable_motors(self):
+        """Configure and enable both motors for torque control"""
+        self.axis.controller.config.control_mode = CONTROL_MODE_TORQUE_CONTROL
+        self.axis.controller.config.input_mode = 1  # INPUT_MODE_PASSTHROUGH
+        self.axis1.controller.config.control_mode = CONTROL_MODE_TORQUE_CONTROL
+        self.axis1.controller.config.input_mode = 1  # INPUT_MODE_PASSTHROUGH
+        self.reader_thread.request_state(AXIS_STATE_CLOSED_LOOP_CONTROL)
+        self.reader_thread.request_state_axis1(AXIS_STATE_CLOSED_LOOP_CONTROL)
+
+    def _disable_motors(self):
+        """Set both motors to idle"""
+        self.reader_thread.request_state(AXIS_STATE_IDLE)
+        self.reader_thread.request_state_axis1(AXIS_STATE_IDLE)
+
+    def on_pretension_changed(self, state):
+        """Toggle pre-tension (Ready) mode"""
         if self.reader_thread is None:
             return
 
         if state == Qt.Checked:
-            # Configure both axes for torque control before entering closed loop
-            self.axis.controller.config.control_mode = CONTROL_MODE_TORQUE_CONTROL
-            self.axis.controller.config.input_mode = 1  # INPUT_MODE_PASSTHROUGH
-            self.axis1.controller.config.control_mode = CONTROL_MODE_TORQUE_CONTROL
-            self.axis1.controller.config.input_mode = 1  # INPUT_MODE_PASSTHROUGH
-            self.reader_thread.request_state(AXIS_STATE_CLOSED_LOOP_CONTROL)
-            self.reader_thread.request_state_axis1(AXIS_STATE_CLOSED_LOOP_CONTROL)
+            self.active_checkbox.blockSignals(True)
+            self.active_checkbox.setChecked(False)
+            self.active_checkbox.blockSignals(False)
+            self.reader_thread.pretension = True
+            self._enable_motors()
+            print(f"[DEBUG] Pre-tension ON ({self.pretension_input.value():.1f} lbs)")
         else:
-            self.reader_thread.request_state(AXIS_STATE_IDLE)
-            self.reader_thread.request_state_axis1(AXIS_STATE_IDLE)
+            self.reader_thread.pretension = False
+            if not self.active_checkbox.isChecked():
+                self._disable_motors()
+            print("[DEBUG] Pre-tension OFF")
 
-    def on_pretension_changed(self, state):
-        """Toggle pre-tension mode (constant force regardless of position)"""
-        if self.reader_thread:
-            self.reader_thread.pretension = (state == Qt.Checked)
-            if state == Qt.Checked:
-                print(f"[DEBUG] Pre-tension ON ({self.pretension_input.value():.1f} lbs)")
-            else:
-                print("[DEBUG] Pre-tension OFF")
+    def on_active_changed(self, state):
+        """Toggle Active (exercise) mode"""
+        if self.reader_thread is None:
+            return
+
+        if state == Qt.Checked:
+            self.pretension_checkbox.blockSignals(True)
+            self.pretension_checkbox.setChecked(False)
+            self.pretension_checkbox.blockSignals(False)
+            self.reader_thread.pretension = False
+            self._enable_motors()
+            print(f"[DEBUG] Active ON ({self.force_input.value():.1f} lbs)")
+        else:
+            if not self.pretension_checkbox.isChecked():
+                self._disable_motors()
+            print("[DEBUG] Active OFF")
 
     def on_pretension_force_changed(self, value):
         """Update the pre-tension force"""
         if self.reader_thread:
             self.reader_thread.pretension_force_lbs = value
+
+    def on_boost_gain_changed(self, value):
+        """Update the pre-tension boost gain"""
+        if self.reader_thread:
+            self.reader_thread.pretension_boost_gain = value
+
+    def on_boost_max_changed(self, value):
+        """Update the pre-tension boost max"""
+        if self.reader_thread:
+            self.reader_thread.pretension_boost_max = value
 
     def start_logging(self):
         """Start a 10-second CSV log"""
@@ -962,19 +993,9 @@ class ExerciseGUI(QMainWindow):
             self.status_msg_label.setText("Enter a valid number")
             self.status_msg_label.setStyleSheet("color: #ef4444;")
 
-    def set_home_position(self):
-        """Set current height as home (floor) height"""
-        self.home_height = self.load_height
-        self.home_display.setText(f"{self.home_height:.1f}")
-
-        if self.reader_thread:
-            self.reader_thread.set_home_height(self.home_height)
-
-        self.status_msg_label.setText(f"Home set to {self.home_height:.1f} inches")
-        self.status_msg_label.setStyleSheet("color: #8b5cf6;")
-
     def emergency_stop(self):
-        self.enable_checkbox.setChecked(False)
+        self.pretension_checkbox.setChecked(False)
+        self.active_checkbox.setChecked(False)
 
         if self.reader_thread:
             self.reader_thread.request_state(AXIS_STATE_IDLE)
@@ -984,7 +1005,8 @@ class ExerciseGUI(QMainWindow):
         if self.reader_thread is None:
             return
 
-        self.enable_checkbox.setChecked(False)
+        self.pretension_checkbox.setChecked(False)
+        self.active_checkbox.setChecked(False)
         self.calibrate_btn.setEnabled(False)
         self.calibrate_btn.setText("Calibrating...")
         self.calibrating = True
@@ -998,7 +1020,8 @@ class ExerciseGUI(QMainWindow):
         if self.reader_thread is None:
             return
 
-        self.enable_checkbox.setChecked(False)
+        self.pretension_checkbox.setChecked(False)
+        self.active_checkbox.setChecked(False)
         self.calibrate_btn_axis1.setEnabled(False)
         self.calibrate_btn_axis1.setText("Calibrating...")
         self.calibrating_axis1 = True
@@ -1011,7 +1034,8 @@ class ExerciseGUI(QMainWindow):
         if self.reader_thread is None:
             return
 
-        self.enable_checkbox.setChecked(False)
+        self.pretension_checkbox.setChecked(False)
+        self.active_checkbox.setChecked(False)
         self.reader_thread.request_clear_errors()
         self.status_msg_label.setText("Errors cleared - recalibrate!")
         self.status_msg_label.setStyleSheet("color: #f59e0b;")
